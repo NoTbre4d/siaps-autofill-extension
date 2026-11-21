@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "SI-APS AutoFill",
+  "version": "1.0.0",
+  "description": "Autocompletado masivo de formularios de caracterización SI-APS. Procesamiento 100% local.",
+  "permissions": ["storage", "activeTab"],
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "SI-APS AutoFill — Toggle Panel"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": [
+        "libs/xlsx.full.min.js",
+        "modules/excel-parser.js",
+        "modules/autofill-engine.js",
+        "modules/panel-ui.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["modules/panel.css", "icons/*"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "commands": {
+    "autofill-current": {
+      "suggested_key": { "default": "Alt+Shift+F" },
+      "description": "Autocompletar formulario actual con datos del paciente"
+    },
+    "toggle-panel": {
+      "suggested_key": { "default": "Alt+Shift+P" },
+      "description": "Mostrar/ocultar panel SI-APS AutoFill"
+    }
+  }
+}

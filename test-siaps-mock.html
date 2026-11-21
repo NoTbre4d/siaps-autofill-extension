@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SI-APS Mock — Formulario de Prueba (Familia Unipersonal)</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, sans-serif;
+      background: #f5f7fa;
+      color: #333;
+      margin: 0;
+      padding: 20px;
+    }
+    h1 {
+      background: linear-gradient(135deg, #1565C0, #0D47A1);
+      color: #fff;
+      padding: 16px 24px;
+      border-radius: 8px;
+      margin: 0 0 20px;
+      font-size: 20px;
+    }
+    h2 {
+      color: #1565C0;
+      border-bottom: 2px solid #BBDEFB;
+      padding-bottom: 6px;
+      margin-top: 30px;
+      font-size: 16px;
+    }
+    .form-section {
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .form-row {
+      display: flex;
+      gap: 16px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+    .form-group {
+      flex: 1;
+      min-width: 200px;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: #555;
+      margin-bottom: 4px;
+    }
+    input, select, textarea {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 13px;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input:focus, select:focus, textarea:focus {
+      border-color: #1565C0;
+      box-shadow: 0 0 0 2px rgba(21, 101, 192, 0.2);
+    }
+    .required::after {
+      content: " *";
+      color: #C62828;
+    }
+    .radio-group, .checkbox-group {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      padding: 6px 0;
+    }
+    .radio-group label, .checkbox-group label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-weight: normal;
+      cursor: pointer;
+    }
+    .radio-group input, .checkbox-group input {
+      width: auto;
+    }
+    fieldset {
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 0 0 14px;
+    }
+    legend {
+      font-weight: 600;
+      color: #1565C0;
+      font-size: 13px;
+      padding: 0 6px;
+    }
+    .btn-submit {
+      padding: 12px 32px;
+      background: #1565C0;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      margin-top: 20px;
+    }
+    .btn-submit:hover { background: #0D47A1; }
+    .info-box {
+      background: #E3F2FD;
+      border: 1px solid #90CAF9;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-size: 12px;
+      color: #1565C0;
+      margin-bottom: 16px;
+    }
+    .hidden-field { display: none; }
+  </style>
+</head>
+<body>
+
+  <h1>🏥 SI-APS — Módulo de Caracterización Familiar (Mock)</h1>
+
+  <div class="info-box">
+    ℹ️ Este es un formulario de prueba que simula el módulo de Familia de SI-APS.
+    Instala la extensión <strong>SI-APS AutoFill</strong>, carga un Excel y presiona <code>Alt+Shift+F</code> o el botón "Autocompletar".
+  </div>
+
+  <form id="form-caracterizacion" novalidate>
+
+    <!-- ═══════ SECCIÓN 1: DATOS DEL JEFE DE HOGAR ═══════ -->
+    <div class="form-section">
+      <h2>1. Datos del Jefe de Hogar / Paciente</h2>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="tipo_documento" class="required">Tipo de Documento</label>
+          <select id="tipo_documento" name="tipo_documento" required>
+            <option value="">-- Seleccione --</option>
+            <option value="RC">Registro Civil</option>
+            <option value="TI">Tarjeta de Identidad</option>
+            <option value="CC">Cédula de Ciudadanía</option>
+            <option value="CE">Cédula de Extranjería</option>
+            <option value="PA">Pasaporte</option>
+            <option value="MS">Menor sin identificación</option>
+            <option value="AS">Adulto sin identificación</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="numero_documento" class="required">Número de Documento</label>
+          <input type="text" id="numero_documento" name="numero_documento" required placeholder="Ej: 1234567890" />
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="primer_nombre" class="required">Primer Nombre</label>
+          <input type="text" id="primer_nombre" name="primer_nombre" required />
+        </div>
+        <div class="form-group">
+          <label for="segundo_nombre">Segundo Nombre</label>
+          <input type="text" id="segundo_nombre" name="segundo_nombre" />
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="primer_apellido" class="required">Primer Apellido</label>
+          <input type="text" id="primer_apellido" name="primer_apellido" required />
+        </div>
+        <div class="form-group">
+          <label for="segundo_apellido">Segundo Apellido</label>
+          <input type="text" id="segundo_apellido" name="segundo_apellido" />
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="fecha_nacimiento">Fecha de Nacimiento</label>
+          <input type="date" id="fecha_nacimiento" name="fecha_nacimiento" />
+        </div>
+        <div class="form-group">
+          <label for="telefono">Teléfono / Celular</label>
+          <input type="text" id="telefono" name="telefono" placeholder="Ej: 3001234567" />
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="direccion" class="required">Dirección de Residencia</label>
+          <input type="text" id="direccion" name="direccion" required minlength="10" placeholder="Ej: Calle 10 # 20-30" />
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="eps" class="required">EPS / Aseguradora</label>
+          <select id="eps" name="eps" required>
+            <option value="">-- Seleccione --</option>
+            <option value="NUEVA_EPS">Nueva EPS</option>
+            <option value="SURA">Sura EPS</option>
+            <option value="SANITAS">Sanitas</option>
+            <option value="SALUD_TOTAL">Salud Total</option>
+            <option value="COOMEVA">Coomeva</option>
+            <option value="COMPENSAR">Compensar</option>
+            <option value="FAMISANAR">Famisanar</option>
+            <option value="COOSALUD">Coosalud</option>
+            <option value="MUTUAL_SER">Mutual Ser</option>
+            <option value="CAPITAL_SALUD">Capital Salud</option>
+            <option value="OTRA">Otra</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ SECCIÓN 2: UBICACIÓN GEOGRÁFICA (Cascada) ═══════ -->
+    <div class="form-section">
+      <h2>2. Ubicación Geográfica</h2>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="departamento" class="required">Departamento</label>
+          <select id="departamento" name="departamento" required>
+            <option value="">-- Seleccione --</option>
+            <option value="ANT">Antioquia</option>
+            <option value="BOG">Bogotá D.C.</option>
+            <option value="VAL">Valle del Cauca</option>
+            <option value="SAN">Santander</option>
+            <option value="ATL">Atlántico</option>
+            <option value="BOL">Bolívar</option>
+            <option value="CUN">Cundinamarca</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="municipio" class="required">Municipio</label>
+          <select id="municipio" name="municipio" required>
+            <option value="">-- Seleccione departamento primero --</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="barrio">Barrio / Vereda</label>
+          <input type="text" id="barrio" name="barrio" placeholder="Ej: Centro, La Esperanza..." />
+        </div>
+        <div class="form-group">
+          <label for="zona">Zona</label>
+          <select id="zona" name="zona">
+            <option value="">-- Seleccione --</option>
+            <option value="U">Urbana</option>
+            <option value="R">Rural</option>
+            <option value="CD">Centro Poblado</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ SECCIÓN 3: COMPOSICIÓN FAMILIAR ═══════ -->
+    <div class="form-section">
+      <h2>3. Composición Familiar</h2>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="tipo_familia" class="required">Tipo de Familia</label>
+          <select id="tipo_familia" name="tipo_familia" required>
+            <option value="">-- Seleccione --</option>
+            <option value="UNI">Unipersonal</option>
+            <option value="NUC">Nuclear</option>
+            <option value="EXT">Extensa</option>
+            <option value="MON">Monoparental</option>
+            <option value="REC">Reconstituida</option>
+            <option value="SIN">Sin núcleo</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="num_integrantes" class="required">Número de Integrantes del Hogar</label>
+          <input type="number" id="num_integrantes" name="num_integrantes" min="1" max="30" step="1" required />
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="parentesco" class="required">Parentesco con el Jefe de Hogar</label>
+          <select id="parentesco" name="parentesco" required>
+            <option value="">-- Seleccione --</option>
+            <option value="JH">Jefe de hogar</option>
+            <option value="CO">Cónyuge</option>
+            <option value="HI">Hijo(a)</option>
+            <option value="PA">Padre/Madre</option>
+            <option value="HE">Hermano(a)</option>
+            <option value="NI">Nieto(a)</option>
+            <option value="OT">Otro pariente</option>
+            <option value="NP">No pariente</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ SECCIÓN 4: CONDICIONES DE SALUD ═══════ -->
+    <div class="form-section">
+      <h2>4. Condiciones de Salud</h2>
+
+      <fieldset>
+        <legend>¿Presenta alguna discapacidad?</legend>
+        <div class="radio-group">
+          <label><input type="radio" name="discapacidad" value="Si" /> Sí</label>
+          <label><input type="radio" name="discapacidad" value="No" /> No</label>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>¿Es adulto mayor (60+ años)?</legend>
+        <div class="radio-group">
+          <label><input type="radio" name="adulto_mayor" value="Si" /> Sí</label>
+          <label><input type="radio" name="adulto_mayor" value="No" /> No</label>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Condiciones especiales (marque las que apliquen)</legend>
+        <div class="checkbox-group">
+          <label><input type="checkbox" name="condicion_embarazo" value="1" /> Gestante</label>
+          <label><input type="checkbox" name="condicion_lactancia" value="1" /> Lactante</label>
+          <label><input type="checkbox" name="condicion_cronica" value="1" /> Enfermedad crónica</label>
+          <label><input type="checkbox" name="condicion_mental" value="1" /> Salud mental</label>
+          <label><input type="checkbox" name="condicion_ninguna" value="1" /> Ninguna</label>
+        </div>
+      </fieldset>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="tipo_sangre">Grupo Sanguíneo</label>
+          <select id="tipo_sangre" name="tipo_sangre">
+            <option value="">-- Seleccione --</option>
+            <option value="A+">A+</option>
+            <option value="A-">A-</option>
+            <option value="B+">B+</option>
+            <option value="B-">B-</option>
+            <option value="O+">O+</option>
+            <option value="O-">O-</option>
+            <option value="AB+">AB+</option>
+            <option value="AB-">AB-</option>
+            <option value="NS">No sabe</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="regimen">Régimen de Afiliación</label>
+          <select id="regimen" name="regimen">
+            <option value="">-- Seleccione --</option>
+            <option value="C">Contributivo</option>
+            <option value="S">Subsidiado</option>
+            <option value="V">Vinculado</option>
+            <option value="E">Especial</option>
+            <option value="P">Prepagada</option>
+            <option value="NA">No afiliado</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ SECCIÓN 5: VIVIENDA ═══════ -->
+    <div class="form-section">
+      <h2>5. Condiciones de Vivienda</h2>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="tipo_vivienda">Tipo de Vivienda</label>
+          <select id="tipo_vivienda" name="tipo_vivienda">
+            <option value="">-- Seleccione --</option>
+            <option value="CA">Casa</option>
+            <option value="AP">Apartamento</option>
+            <option value="HA">Habitación</option>
+            <option value="CH">Choza / Rancho</option>
+            <option value="OT">Otro</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="tenencia_vivienda">Tenencia</label>
+          <select id="tenencia_vivienda" name="tenencia_vivienda">
+            <option value="">-- Seleccione --</option>
+            <option value="P">Propia</option>
+            <option value="A">Arrendada</option>
+            <option value="F">Familiar</option>
+            <option value="I">Invasión</option>
+            <option value="O">Otra</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="num_habitaciones">Número de Habitaciones</label>
+          <input type="number" id="num_habitaciones" name="num_habitaciones" min="1" max="20" />
+        </div>
+        <div class="form-group">
+          <label for="personas_por_habitacion">Personas por Habitación</label>
+          <input type="number" id="personas_por_habitacion" name="personas_por_habitacion" min="1" max="20" />
+        </div>
+      </div>
+
+      <fieldset>
+        <legend>Servicios Públicos (marque los disponibles)</legend>
+        <div class="checkbox-group">
+          <label><input type="checkbox" name="servicio_agua" value="1" /> Acueducto</label>
+          <label><input type="checkbox" name="servicio_alcantarillado" value="1" /> Alcantarillado</label>
+          <label><input type="checkbox" name="servicio_energia" value="1" /> Energía</label>
+          <label><input type="checkbox" name="servicio_gas" value="1" /> Gas</label>
+          <label><input type="checkbox" name="servicio_internet" value="1" /> Internet</label>
+          <label><input type="checkbox" name="servicio_recoleccion" value="1" /> Recolección de basuras</label>
+        </div>
+      </fieldset>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="condicion_vivienda">Estado General de la Vivienda</label>
+          <select id="condicion_vivienda" name="condicion_vivienda">
+            <option value="">-- Seleccione --</option>
+            <option value="B">Bueno</option>
+            <option value="R">Regular</option>
+            <option value="M">Malo</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ SECCIÓN 6: OBSERVACIONES ═══════ -->
+    <div class="form-section">
+      <h2>6. Observaciones</h2>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="observaciones" class="required">Observaciones Generales</label>
+          <textarea id="observaciones" name="observaciones" rows="4" required minlength="10" maxlength="500"
+            placeholder="Mínimo 10 caracteres. Describa situación del paciente/familia..."></textarea>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="motivo_visita">Motivo de la Visita</label>
+          <textarea id="motivo_visita" name="motivo_visita" rows="3" minlength="15"
+            placeholder="Mínimo 15 caracteres..."></textarea>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label for="fecha_visita" class="required">Fecha de Visita</label>
+          <input type="date" id="fecha_visita" name="fecha_visita" required />
+        </div>
+        <div class="form-group">
+          <label for="profesional_responsable">Profesional Responsable</label>
+          <input type="text" id="profesional_responsable" name="profesional_responsable" minlength="10"
+            placeholder="Nombre completo del profesional..." />
+        </div>
+      </div>
+    </div>
+
+    <!-- Hidden field (should be ignored by autofill) -->
+    <input type="hidden" name="form_version" value="3.2.1" />
+    <input type="hidden" name="session_token" value="mock-token-xyz" />
+
+    <button type="button" class="btn-submit" onclick="alert('⚠️ Este formulario es un mock de prueba. Los datos NO se envían a ningún servidor.')">
+      💾 Guardar Caracterización
+    </button>
+
+  </form>
+
+  <!-- ═══════ Script: Cascada Departamento → Municipio ═══════ -->
+  <script>
+    const municipios = {
+      ANT: ['Medellín', 'Bello', 'Envigado', 'Itagüí', 'Rionegro', 'Apartadó', 'Turbo', 'Caucasia'],
+      BOG: ['Bogotá D.C.'],
+      VAL: ['Cali', 'Buenaventura', 'Palmira', 'Tuluá', 'Cartago', 'Buga', 'Jamundí'],
+      SAN: ['Bucaramanga', 'Floridablanca', 'Girón', 'Piedecuesta', 'Barrancabermeja', 'San Gil'],
+      ATL: ['Barranquilla', 'Soledad', 'Malambo', 'Sabanalarga', 'Galapa'],
+      BOL: ['Cartagena', 'Magangué', 'Turbaco', 'El Carmen de Bolívar', 'Arjona'],
+      CUN: ['Soacha', 'Facatativá', 'Zipaquirá', 'Chía', 'Fusagasugá', 'Madrid', 'Mosquera', 'Girardot'],
+    };
+
+    const deptSelect = document.getElementById('departamento');
+    const munSelect = document.getElementById('municipio');
+
+    deptSelect.addEventListener('change', () => {
+      const code = deptSelect.value;
+      munSelect.innerHTML = '<option value="">-- Seleccione --</option>';
+      if (municipios[code]) {
+        municipios[code].forEach((m) => {
+          const opt = document.createElement('option');
+          opt.value = m;
+          opt.textContent = m;
+          munSelect.appendChild(opt);
+        });
+      }
+      // Trigger change para que frameworks lo detecten
+      munSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  </script>
+
+</body>
+</html>
