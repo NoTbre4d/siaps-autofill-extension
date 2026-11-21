@@ -1,18 +1,15 @@
 /**
  * SI-APS AutoFill — PanelUI
  *
- * Panel flotante lateral con Shadow DOM para no interferir con los estilos
- * de la página huésped. Gestiona:
+ * Panel flotante lateral con Shadow DOM.
+ * Gestiona:
  *   - Carga de Excel y cola de pacientes.
  *   - Búsqueda, navegación, marcado de completados.
- *   - Pestaña de configuración de valores por defecto.
- *   - Botón de exportar mapa de campos.
- *   - Persistencia en chrome.storage.local.
- *
- * API pública:
- *   PanelUI.init(autofillEngine) -> void
- *   PanelUI.show() / PanelUI.hide() / PanelUI.toggle()
- *   PanelUI.triggerAutofill()
+ *   - Módulo activo y Sistema de Plantillas por Módulo (Grabar / Replicar / Borrar).
+ *   - Botón principal de autocompletado (Plantilla + Excel / Automático).
+ *   - Pestaña de configuración de valores asumidos.
+ *   - Exportar mapa de campos sin datos personales.
+ *   - Persistencia completa en chrome.storage.local.
  */
 
 // eslint-disable-next-line no-unused-vars
@@ -23,6 +20,8 @@ class PanelUI {
     this.patients = [];
     this.currentIndex = 0;
     this.completed = new Set();
+    this.templates = {}; // { [moduleName]: templateObject }
+    this.activeModule = 'Información General';
     this.host = null;
     this.shadow = null;
     this.visible = false;
@@ -36,7 +35,7 @@ class PanelUI {
   async init(autofillEngine) {
     this.engine = autofillEngine;
 
-    // Crear host Shadow DOM
+    // Crear host Shadow DOM aislado
     this.host = document.createElement('div');
     this.host.id = 'siaps-autofill-host';
     this.host.style.cssText = 'all: initial; position: fixed; top: 0; right: 0; z-index: 2147483647; font-family: system-ui, sans-serif;';
@@ -50,8 +49,11 @@ class PanelUI {
     // Renderizar panel
     this._render();
 
-    // Restaurar estado persistido
+    // Restaurar estado persistido y plantillas
     await this._loadState();
+
+    // Detectar módulo inicial
+    this._autoDetectModule();
 
     // Eventos
     this._bindEvents();
@@ -107,6 +109,33 @@ class PanelUI {
         <!-- TAB: Cola de pacientes -->
         <div class="tab-content" id="tab-queue">
 
+          <!-- Sección: Módulo y Plantilla -->
+          <div class="section module-section">
+            <div class="module-header-row">
+              <label class="module-title-label">📂 Módulo:</label>
+              <select id="sel-active-module" class="module-select">
+                <option value="Información General">Información General</option>
+                <option value="Entorno y Vivienda">Entorno y Vivienda</option>
+                <option value="Familia">Familia</option>
+                <option value="Integrantes">Integrantes</option>
+              </select>
+              <button id="btn-detect-module" title="Detectar pestaña actual de SI-APS">🔍</button>
+            </div>
+
+            <div class="template-status-row">
+              <span id="template-badge" class="badge-template none">⚪ Sin plantilla (modo automático)</span>
+            </div>
+
+            <div class="template-btn-row">
+              <button id="btn-save-template" class="btn-sm btn-outline" title="Guarda las respuestas de esta pantalla como plantilla para este módulo">
+                💾 Guardar plantilla
+              </button>
+              <button id="btn-delete-template" class="btn-sm btn-danger-sm" style="display:none;" title="Borrar la plantilla guardada para este módulo">
+                🗑️ Borrar
+              </button>
+            </div>
+          </div>
+
           <!-- Carga de archivo -->
           <div class="section" id="section-upload">
             <label class="file-upload-label" for="siaps-file-input">
@@ -157,7 +186,7 @@ class PanelUI {
             <!-- Acciones -->
             <div class="action-buttons">
               <button id="btn-autofill" class="btn-primary" title="Alt+Shift+F">
-                ⚡ Autocompletar página
+                ⚡ Llenar módulo (Plantilla + Excel)
               </button>
               <button id="btn-complete" class="btn-success">
                 ✅ Completado → Siguiente
@@ -240,6 +269,20 @@ class PanelUI {
       tab.addEventListener('click', () => this._switchTab(tab.dataset.tab));
     });
 
+    // Módulo activo
+    $('#sel-active-module').addEventListener('change', (e) => {
+      this.activeModule = e.target.value;
+      this._updateTemplateBadge();
+    });
+
+    $('#btn-detect-module').addEventListener('click', () => {
+      this._autoDetectModule();
+    });
+
+    // Guardar / Borrar plantilla
+    $('#btn-save-template').addEventListener('click', () => this._saveCurrentModuleTemplate());
+    $('#btn-delete-template').addEventListener('click', () => this._deleteCurrentModuleTemplate());
+
     // Archivo
     $('#siaps-file-input').addEventListener('change', (e) => this._onFileSelect(e));
 
@@ -279,12 +322,75 @@ class PanelUI {
   }
 
   /* ═══════════════════════════════════════════
+     SISTEMA DE PLANTILLAS POR MÓDULO
+     ═══════════════════════════════════════════ */
+
+  _autoDetectModule() {
+    const detected = this.engine.detectActiveModuleName();
+    if (detected) {
+      this.activeModule = detected;
+      const select = this.shadow.querySelector('#sel-active-module');
+      if (select) select.value = detected;
+      this._updateTemplateBadge();
+    }
+  }
+
+  _updateTemplateBadge() {
+    const badge = this.shadow.querySelector('#template-badge');
+    const deleteBtn = this.shadow.querySelector('#btn-delete-template');
+    const autofillBtn = this.shadow.querySelector('#btn-autofill');
+
+    const template = this.templates[this.activeModule];
+
+    if (template && template.fields && template.fields.length > 0) {
+      badge.textContent = `🟢 Plantilla activa: Sí (${template.fields.length} campos)`;
+      badge.className = 'badge-template active';
+      deleteBtn.style.display = '';
+      if (autofillBtn) autofillBtn.textContent = '⚡ Llenar módulo (Plantilla + Excel)';
+    } else {
+      badge.textContent = '⚪ Sin plantilla (modo automático)';
+      badge.className = 'badge-template none';
+      deleteBtn.style.display = 'none';
+      if (autofillBtn) autofillBtn.textContent = '⚡ Autocompletar módulo (Automático)';
+    }
+  }
+
+  async _saveCurrentModuleTemplate() {
+    try {
+      const snapshot = this.engine.extractModuleSnapshot(this.activeModule);
+      if (snapshot.fields.length === 0) {
+        this._showResult('⚠️ No se detectaron campos con valor en pantalla para guardar.', 'warn');
+        return;
+      }
+
+      this.templates[this.activeModule] = snapshot;
+      await chrome.storage.local.set({ siaps_templates: this.templates });
+
+      this._updateTemplateBadge();
+      this._showResult(`💾 Plantilla guardada para <strong>${this.activeModule}</strong> con ${snapshot.fields.length} campos.`, 'success');
+    } catch (err) {
+      this._showResult(`❌ Error al guardar plantilla: ${err.message}`, 'error');
+    }
+  }
+
+  async _deleteCurrentModuleTemplate() {
+    if (!confirm(`¿Eliminar la plantilla guardada para el módulo "${this.activeModule}"?`)) return;
+
+    delete this.templates[this.activeModule];
+    await chrome.storage.local.set({ siaps_templates: this.templates });
+
+    this._updateTemplateBadge();
+    this._showResult(`🗑️ Plantilla eliminada para "${this.activeModule}".`, 'success');
+  }
+
+  /* ═══════════════════════════════════════════
      SHOW / HIDE / TOGGLE
      ═══════════════════════════════════════════ */
 
   show() {
     this.panel.classList.remove('collapsed');
     this.visible = true;
+    this._autoDetectModule();
   }
 
   hide() {
@@ -338,7 +444,6 @@ class PanelUI {
       }
       statusEl.innerHTML = `<span class="success">${statusMsg}</span>`;
 
-      // Mostrar secciones
       $('#section-search').style.display = '';
       $('#section-patient').style.display = '';
       $('#section-tools').style.display = '';
@@ -375,7 +480,6 @@ class PanelUI {
     this.completed.add(patient.numeroId || this.currentIndex.toString());
     this._updatePatientDisplay();
 
-    // Avanzar al siguiente no completado
     let next = this.currentIndex + 1;
     while (next < this.patients.length) {
       const p = this.patients[next];
@@ -403,22 +507,19 @@ class PanelUI {
     $('#patient-doc').textContent = `${patient.tipoId || '?'} ${patient.numeroId || '?'}`;
     $('#patient-completed-badge').style.display = isCompleted ? '' : 'none';
 
-    // Edición de nombre
     $('#edit-primerNombre').value = patient.primerNombre || '';
     $('#edit-segundoNombre').value = patient.segundoNombre || '';
     $('#edit-primerApellido').value = patient.primerApellido || '';
     $('#edit-segundoApellido').value = patient.segundoApellido || '';
 
-    // Estados de botones
     $('#btn-prev').disabled = this.currentIndex <= 0;
     $('#btn-next').disabled = this.currentIndex >= this.patients.length - 1;
 
-    // Limpiar resultado anterior
     $('#fill-result').style.display = 'none';
   }
 
   /* ═══════════════════════════════════════════
-     AUTOCOMPLETAR
+     AUTOCOMPLETAR (Plantilla o Barrido Automático)
      ═══════════════════════════════════════════ */
 
   async triggerAutofill() {
@@ -435,21 +536,38 @@ class PanelUI {
       familiaUnipersonal: $('#chk-unipersonal').checked,
     };
 
-    this._showResult('⏳ Autocompletando...', 'loading');
+    const hasTemplate = Boolean(this.templates[this.activeModule]);
+    this._showResult(`⏳ Diligenciando módulo "${this.activeModule}" (${hasTemplate ? 'con Plantilla' : 'modo automático'})...`, 'loading');
 
     try {
-      const result = await this.engine.fillForm(patient, options);
+      let result;
+      if (hasTemplate) {
+        result = await this.engine.applyModuleTemplate(this.templates[this.activeModule], patient, options);
+      } else {
+        result = await this.engine.fillForm(patient, options);
+      }
 
-      let msg = `✅ <strong>${result.filled.length}</strong> campo(s) completado(s).`;
-      if (result.skipped.length > 0) {
-        msg += `<br>⏭️ ${result.skipped.length} ya tenían valor (no sobrescritos).`;
+      const total = result.filled.length;
+      let msg = `✅ <strong>${total}</strong> campo(s) diligenciado(s) en <strong>${this.activeModule}</strong>.`;
+
+      if (hasTemplate) {
+        msg += `<br><small style="color:#2E7D32;">🎯 Aplicada plantilla guardada + datos del paciente activo.</small>`;
+      } else {
+        const f1 = result.filled.filter((f) => f.phase === '1').length;
+        const f2 = result.filled.filter((f) => f.phase === '2').length;
+        msg += `<br><small style="color:#2E7D32;">🔹 Fase 1 (Excel): ${f1} | 🔸 Fase 2 (Asumidos): ${f2}</small>`;
       }
-      if (result.unresolved.length > 0) {
-        msg += `<br>⚠️ ${result.unresolved.length} campo(s) obligatorio(s) no resuelto(s) (marcados en amarillo).`;
+
+      if (result.skipped && result.skipped.length > 0) {
+        msg += `<br>⏭️ ${result.skipped.length} campos ya tenían valor (no sobrescritos).`;
       }
-      this._showResult(msg, result.unresolved.length > 0 ? 'warn' : 'success');
+      if (result.unresolved && result.unresolved.length > 0) {
+        msg += `<br>⚠️ ${result.unresolved.length} campos obligatorios sin resolver (marcados en amarillo).`;
+      }
+
+      this._showResult(msg, (result.unresolved && result.unresolved.length > 0) ? 'warn' : 'success');
     } catch (err) {
-      this._showResult(`❌ Error: ${err.message}`, 'error');
+      this._showResult(`❌ Error en autocompletado: ${err.message}`, 'error');
       console.error('[SI-APS] Error en autofill:', err);
     }
   }
@@ -494,7 +612,6 @@ class PanelUI {
         </div>`;
       }).join('');
 
-      // Click en resultado
       resultsEl.querySelectorAll('.search-item').forEach((item) => {
         item.addEventListener('click', () => {
           this._goToPatient(parseInt(item.dataset.index));
@@ -529,18 +646,16 @@ class PanelUI {
   }
 
   /* ═══════════════════════════════════════════
-     EXPORTAR MAPA DE CAMPOS
+     EXPORTAR MAPA DE CAMPOS (JSON)
      ═══════════════════════════════════════════ */
 
   _exportFieldMap() {
     const map = this.engine.exportFieldMap();
     const json = JSON.stringify(map, null, 2);
 
-    // Copiar al portapapeles
     navigator.clipboard.writeText(json).then(() => {
       this._showResult(`📋 Mapa de ${map.length} campo(s) copiado al portapapeles.`, 'success');
     }).catch(() => {
-      // Fallback: descargar como archivo
       this._downloadJSON(map, 'siaps-field-map.json');
       this._showResult(`📥 Mapa de ${map.length} campo(s) descargado.`, 'success');
     });
@@ -582,24 +697,25 @@ class PanelUI {
 
   _resetSettings() {
     this.engine.settings.neutralOptions = [
-      'No', 'Ninguno', 'No aplica', 'Normal', 'Bueno',
-      'Adecuado', 'Sin novedad', 'No refiere', 'Ninguna',
-      'No presenta', 'Negativo', 'Sano'
+      'No', 'Ninguno', 'Ninguna', 'No aplica', 'N/A', 'Normal',
+      'Bueno', 'Buena', 'Adecuado', 'Sin novedad', 'No refiere',
+      'Urbano', 'Propio', 'Si', 'No presenta', 'Negativo', 'Sano'
     ];
     this.engine.settings.defaultTexts = {
       short: 'No aplica.',
-      long: 'Sin observaciones adicionales. No refiere novedades al momento de la valoración.',
+      long: 'No refiere novedades durante la caracterización.',
     };
     this._populateSettings();
     this._saveState();
   }
 
   async _clearAllData() {
-    if (!confirm('¿Estás seguro de que deseas eliminar toda la información almacenada (pacientes, progreso, configuración)?')) return;
+    if (!confirm('¿Estás seguro de que deseas eliminar toda la información almacenada (pacientes, plantillas, configuración)?')) return;
     this.patients = [];
     this.currentIndex = 0;
     this.completed = new Set();
-    await chrome.storage.local.remove('siaps_state');
+    this.templates = {};
+    await chrome.storage.local.remove(['siaps_state', 'siaps_templates']);
 
     const $ = (sel) => this.shadow.querySelector(sel);
     $('#section-search').style.display = 'none';
@@ -607,6 +723,7 @@ class PanelUI {
     $('#section-tools').style.display = 'none';
     $('#upload-status').innerHTML = '<span class="success">🗑️ Datos eliminados.</span>';
     $('#siaps-file-input').value = '';
+    this._updateTemplateBadge();
   }
 
   /* ═══════════════════════════════════════════
@@ -634,30 +751,37 @@ class PanelUI {
 
   async _loadState() {
     try {
-      const { siaps_state } = await chrome.storage.local.get('siaps_state');
-      if (!siaps_state) return;
+      // 1. Cargar estado de pacientes y configuración
+      const { siaps_state, siaps_templates } = await chrome.storage.local.get(['siaps_state', 'siaps_templates']);
 
-      if (siaps_state.patients && siaps_state.patients.length > 0) {
-        this.patients = siaps_state.patients;
-        this.currentIndex = siaps_state.currentIndex || 0;
-        this.completed = new Set(siaps_state.completed || []);
-
-        // Restaurar settings del motor
-        if (siaps_state.settings) {
-          Object.assign(this.engine.settings, siaps_state.settings);
-        }
-
-        // Mostrar secciones
-        const $ = (sel) => this.shadow.querySelector(sel);
-        $('#section-search').style.display = '';
-        $('#section-patient').style.display = '';
-        $('#section-tools').style.display = '';
-        $('#upload-status').innerHTML = `<span class="success">♻️ ${this.patients.length} paciente(s) restaurados de sesión anterior.</span>`;
-        $('#chk-overwrite').checked = this.engine.settings.overwrite;
-        $('#chk-unipersonal').checked = this.engine.settings.familiaUnipersonal;
-
-        this._updatePatientDisplay();
+      if (siaps_templates) {
+        this.templates = siaps_templates;
+        this.engine.templates = siaps_templates;
       }
+
+      if (siaps_state) {
+        if (siaps_state.patients && siaps_state.patients.length > 0) {
+          this.patients = siaps_state.patients;
+          this.currentIndex = siaps_state.currentIndex || 0;
+          this.completed = new Set(siaps_state.completed || []);
+
+          if (siaps_state.settings) {
+            Object.assign(this.engine.settings, siaps_state.settings);
+          }
+
+          const $ = (sel) => this.shadow.querySelector(sel);
+          $('#section-search').style.display = '';
+          $('#section-patient').style.display = '';
+          $('#section-tools').style.display = '';
+          $('#upload-status').innerHTML = `<span class="success">♻️ ${this.patients.length} paciente(s) restaurados de sesión anterior.</span>`;
+          $('#chk-overwrite').checked = this.engine.settings.overwrite;
+          $('#chk-unipersonal').checked = this.engine.settings.familiaUnipersonal;
+
+          this._updatePatientDisplay();
+        }
+      }
+
+      this._updateTemplateBadge();
     } catch (err) {
       console.warn('[SI-APS] Error al restaurar estado:', err);
     }

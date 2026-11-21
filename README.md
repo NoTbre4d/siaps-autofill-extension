@@ -40,17 +40,30 @@ Extensión de Chrome (Manifest V3) para **autocompletar masivamente** los formul
 3. En el panel, haz clic en **"📂 Cargar Excel (.xlsx)"** y selecciona tu archivo.
 4. El panel mostrará el número de pacientes cargados y posibles advertencias.
 
-### 2. Autocompletar un formulario
+### 2. Autocompletar un formulario (Plantilla por Módulo o Barrido Total)
 
-1. Navega al formulario de SI-APS que deseas diligenciar.
-2. Verifica que el paciente correcto esté seleccionado en el panel (usa los botones ◀ / ▶ o el buscador).
-3. Presiona **`Alt + Shift + F`** o el botón **"⚡ Autocompletar página"**.
-4. La extensión llenará automáticamente los campos detectados:
-   - 🟢 **Borde verde** = campo llenado exitosamente.
-   - 🟡 **Borde amarillo** = campo obligatorio que no se pudo resolver (revisa manualmente).
-5. **Revisa los campos** y haz clic en "Guardar" manualmente (la extensión NUNCA hace clic en botones de guardar).
+1. Navega al módulo de SI-APS que deseas diligenciar (`Información General`, `Entorno y Vivienda`, `Familia`, `Integrantes`).
+2. Verifica en el panel que el **Módulo activo** coincida (puedes usar el botón 🔍 para detectarlo automáticamente).
+3. Presiona **`Alt + Shift + F`** o el botón **"⚡ Llenar módulo (Plantilla + Excel)"**:
+   - **🎯 Modo con Plantilla guardada:**
+     - Si grabaste una plantilla para ese módulo, la extensión aplica exactamente las opciones guardadas (abriendo desplegables personalizados y marcando checkboxes/radios idénticos).
+     - Sobreescribe dinámicamente los campos personales (`nombre`, `cédula`, `dirección`, `teléfono`, `fecha`) con los datos del paciente activo del Excel.
+     - Aplica barrido solo sobre campos que sigan vacíos.
+   - **⚡ Modo Automático (Sin plantilla):**
+     - **🔹 Fase 1 (Excel y Familia Unipersonal):** Inyecta datos del paciente activo, fuerza 1 integrante, familia Unipersonal y Jefe de hogar.
+     - **🔸 Fase 2 (Barrido Asumido Inteligente):**
+       - **Desplegables personalizados:** Detecta cualquier control cuyo texto sea "Seleccione..." o tenga flechas/atributos combobox, lo abre, busca opciones en el portal del DOM y elige la respuesta neutral o la primera válida.
+       - **Checkboxes estilizados:** Detecta inputs ocultos por CSS, hace clic en el `<label>`, marca únicamente "4. No aplica" en grupos de situación y deja desmarcadas preguntas condicionales como *"¿Tiene otra ubicación diferente?"*.
+       - **Campos de ubicación vs observaciones:** Campos como `"Nombre Tipo de Ubicación"` y `"Ubicación"` reciben el barrio/dirección corta del Excel (o "CENTRO"). Las frases largas se reservan únicamente para `<textarea>` u observaciones.
+       - **Protección readonly:** Respeta campos bloqueados como Geopunto GPS, ID Vivienda y Hacinamiento sin modificarlos.
 
-### 3. Marcar como completado y continuar
+### 3. Grabar y Administrar Plantillas por Módulo
+
+- **Guardar plantilla:** Llena manualmente (o ajusta) una pantalla de SI-APS según el estándar de tu centro y haz clic en **"💾 Guardar plantilla"**. La extensión grabará las respuestas asumidas para ese módulo (excluyendo datos personales del paciente y campos bloqueados).
+- **Borrar plantilla:** Haz clic en **"🗑️ Borrar"** si deseas reconfigurarla o volver al modo 100% automático para ese módulo.
+- **Indicador:** El badge mostrará `🟢 Plantilla activa: Sí (X campos)` o `⚪ Sin plantilla (modo automático)`.
+
+### 4. Marcar como completado y continuar
 
 - Cuando termines con un paciente, haz clic en **"✅ Completado → Siguiente"**.
 - El paciente se marca como completado y el panel avanza al siguiente pendiente.

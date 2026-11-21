@@ -1,96 +1,436 @@
 /**
- * SI-APS AutoFill — AutofillEngine
+ * SI-APS AutoFill — AutofillEngine (Motor de Barrido Total con Soporte de Plantillas por Módulo)
  *
- * Motor de autocompletado inteligente y framework-safe.
- * - Usa setters nativos del prototipo + dispatch de eventos.
- * - Detecta contexto de cada campo (label, placeholder, name, id, aria).
- * - Soporta selects en cascada con MutationObserver.
- * - Respeta minlength, maxlength, min, max, pattern.
- * - Nunca hace clic en botones de guardar/enviar.
- *
- * API pública:
- *   engine.fillForm(patientData, options) -> Promise<{ filled, unresolved, skipped }>
- *   engine.exportFieldMap() -> Array<fieldMeta>
+ * Mejoras clave:
+ *  1. Detección universal de desplegables personalizados:
+ *     - Detecta <select> y cualquier contenedor (div, button, span, input readonly) cuyo texto
+ *       comience por "Seleccione" o contenga chevrones/atributos combobox.
+ *     - Secuencia de eventos reales (mousedown -> mouseup -> click) + espera por popovers en portal (body).
+ *     - Pausa de 200 ms entre selecciones para evitar colisiones.
+ *  2. Checkboxes y Radios estilizados:
+ *     - Detecta inputs ocultos por CSS (opacity: 0, 0px) si su <label> o contenedor es visible.
+ *     - Clic sobre el <label> visual para actualizar modelos reactivos.
+ *     - Si un grupo tiene opción "No aplica" / "Ninguno", marca ÚNICAMENTE esa.
+ *     - Preguntas condicionales ("¿Tiene otra...", "¿Desea agregar...") se dejan desmarcadas por defecto.
+ *  3. Diferenciación estricta de textos:
+ *     - "Ubicación", "Nombre tipo de ubicación", barrios/sectores reciben datos de dirección/barrio del Excel (ej. "CENTRO").
+ *     - Textos largos de observaciones se reservan EXCLUSIVAMENTE para textareas o campos con "observacion", "detalle", etc.
+ *     - Protección total contra edición de campos disabled / readonly (Geopunto, ID Vivienda, Hacinamiento).
+ *  4. Sistema de Plantillas por Módulo:
+ *     - Graba y replica respuestas asumidas por módulo (Información General, Entorno y Vivienda, Familia, Integrantes).
+ *     - Prioriza datos del paciente activo del Excel sobre campos dinámicos.
  */
 
 // eslint-disable-next-line no-unused-vars
 class AutofillEngine {
 
   constructor() {
-    // Reglas configurables (se sobreescriben desde el panel)
     this.settings = {
       overwrite: false,
       familiaUnipersonal: true,
       neutralOptions: [
-        'No', 'Ninguno', 'No aplica', 'Normal', 'Bueno',
-        'Adecuado', 'Sin novedad', 'No refiere', 'Ninguna',
-        'No presenta', 'Negativo', 'Sano'
+        'No', 'Ninguno', 'Ninguna', 'No aplica', 'N/A', 'Normal',
+        'Bueno', 'Buena', 'Adecuado', 'Sin novedad', 'No refiere',
+        'Urbano', 'Propio', 'Si', 'No presenta', 'Negativo', 'Sano'
       ],
       defaultTexts: {
         short: 'No aplica.',
-        long: 'Sin observaciones adicionales. No refiere novedades al momento de la valoración.',
+        long: 'No refiere novedades durante la caracterización.',
       },
     };
+
+    this.templates = {}; // { [moduleName]: templateData }
   }
 
-  /* ═══════════════════════════════════════════
-     FRAMEWORK-SAFE VALUE SETTING
-     ═══════════════════════════════════════════ */
+  /* ══════════════════════════════════════════════════════════════
+     1. RECORRIDO RECURSIVO DEL DOM (Document, Shadow DOM, Iframes)
+     ══════════════════════════════════════════════════════════════ */
 
-  _getPrototypeSetter(element) {
-    const tag = element.tagName;
-    if (tag === 'SELECT') {
-      return Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+  _collectAllElements(root = document, visited = new Set()) {
+    if (!root || visited.has(root)) return [];
+    visited.add(root);
+
+    const elements = [];
+    let nodeList = [];
+
+    try {
+      if (root.nodeType === Node.DOCUMENT_NODE || root.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+        nodeList = Array.from(root.querySelectorAll('*'));
+      } else if (root.querySelectorAll) {
+        nodeList = [root, ...Array.from(root.querySelectorAll('*'))];
+      }
+    } catch {
+      return elements;
     }
-    if (tag === 'TEXTAREA') {
-      return Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+
+    for (const el of nodeList) {
+      // Excluir panel de la extensión
+      if (el.id === 'siaps-autofill-host' || (el.closest && el.closest('#siaps-autofill-host'))) {
+        continue;
+      }
+
+      elements.push(el);
+
+      // Shadow DOM abierto
+      if (el.shadowRoot && !visited.has(el.shadowRoot)) {
+        elements.push(...this._collectAllElements(el.shadowRoot, visited));
+      }
+
+      // Iframes same-origin
+      if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+        try {
+          const frameDoc = el.contentDocument || el.contentWindow?.document;
+          if (frameDoc && !visited.has(frameDoc)) {
+            elements.push(...this._collectAllElements(frameDoc, visited));
+          }
+        } catch {
+          // Cross-origin iframe
+        }
+      }
     }
-    return Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+
+    return elements;
   }
+
+  _isBlockedOrReadonly(el) {
+    if (!el) return true;
+    if (el.disabled || el.readOnly) return true;
+    if (el.hasAttribute('disabled') || el.hasAttribute('readonly')) return true;
+    if (el.getAttribute('aria-disabled') === 'true' || el.getAttribute('aria-readonly') === 'true') return true;
+
+    // Verificar clases de bloqueo
+    const cls = typeof el.className === 'string' ? el.className.toLowerCase() : '';
+    if (cls.includes('disabled') || cls.includes('readonly') || cls.includes('bloqueado')) return true;
+
+    // Verificar estilo computado
+    try {
+      const style = window.getComputedStyle(el);
+      if (style.pointerEvents === 'none') return true;
+      // Colores de fondo grises típicos de inputs deshabilitados (ej: geopunto, id vivienda)
+      const bg = style.backgroundColor;
+      if (bg === 'rgb(233, 236, 239)' || bg === 'rgb(238, 238, 238)' || bg === 'rgb(245, 245, 245)') {
+        if (el.tagName === 'INPUT' && (el.readOnly || el.disabled || el.getAttribute('tabindex') === '-1')) {
+          return true;
+        }
+      }
+    } catch {
+      // Ignorar
+    }
+
+    return false;
+  }
+
+  _isElementVisible(el) {
+    if (!el) return false;
+    if (el.offsetParent !== null) {
+      try {
+        const s = window.getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden') return false;
+      } catch {
+        // Ignorar
+      }
+      return true;
+    }
+    if (el.tagName === 'BODY') return true;
+    try {
+      const s = window.getComputedStyle(el);
+      if (s.position === 'fixed' && s.display !== 'none' && s.visibility !== 'hidden') return true;
+    } catch {
+      // Ignorar
+    }
+    return false;
+  }
+
+  _isVisible(el) {
+    if (!el) return false;
+
+    // Para inputs de checkbox y radio estilizados:
+    // Aunque el <input> tenga opacity: 0, position: absolute o tamaño 0, si su <label> o contenedor es visible, ¡ES VÁLIDO!
+    if (el.tagName === 'INPUT' && ['checkbox', 'radio'].includes((el.type || '').toLowerCase())) {
+      const label = this._getAssociatedLabel(el);
+      if (label && this._isElementVisible(label)) return true;
+      const parent = el.parentElement;
+      if (parent && this._isElementVisible(parent)) return true;
+    }
+
+    return this._isElementVisible(el);
+  }
+
+  _getAssociatedLabel(el) {
+    if (!el) return null;
+    const doc = el.ownerDocument || document;
+    if (el.id) {
+      try {
+        const lbl = doc.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (lbl) return lbl;
+      } catch {
+        // Ignorar
+      }
+    }
+    return el.closest ? el.closest('label') : null;
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     2. DETECCIÓN DE DESPLEGABLES PERSONALIZADOS ("Seleccione...")
+     ══════════════════════════════════════════════════════════════ */
+
+  _isCustomDropdownElement(el) {
+    if (!el || !el.tagName) return false;
+    if (el.tagName === 'SELECT') return false;
+    if (el.id === 'siaps-autofill-host' || (el.closest && el.closest('#siaps-autofill-host'))) return false;
+    if (this._isBlockedOrReadonly(el)) return false;
+
+    const tag = el.tagName.toLowerCase();
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const ariaHasPopup = (el.getAttribute('aria-haspopup') || '').toLowerCase();
+    const cls = typeof el.className === 'string' ? el.className.toLowerCase() : '';
+
+    // Controles estándar de frameworks
+    if (tag === 'mat-select' || tag === 'ng-select' || role === 'combobox' || ariaHasPopup === 'listbox' || ariaHasPopup === 'true') {
+      return true;
+    }
+    if (cls.includes('select2-selection') || cls.includes('p-dropdown') || cls.includes('ant-select-selector')) {
+      return true;
+    }
+
+    // Contenedores clicables (div, button, span, input readonly) dentro de formularios
+    if (['div', 'button', 'span', 'input'].includes(tag)) {
+      if (el.closest && el.closest('[role="listbox"], .dropdown-menu, .select-options, ul, ol')) {
+        return false; // Es un elemento de la lista desplegada, no el trigger
+      }
+
+      // Si es un input pero no es readonly ni tiene clase de select, verificar si tiene placeholder de selección
+      if (tag === 'input') {
+        const ph = (el.placeholder || '').toLowerCase();
+        if (!el.readOnly && !ph.includes('seleccione') && !ph.includes('seleccionar')) {
+          return false;
+        }
+      }
+
+      const text = (el.textContent || el.value || el.placeholder || '').trim();
+      const normText = this._norm(text);
+
+      // Si el texto visible comienza con "seleccione" o "seleccionar"
+      if (normText.startsWith('seleccione') || normText.startsWith('seleccionar') ||
+          normText.includes('seleccione tipo') || normText.includes('seleccione area') ||
+          normText.includes('seleccione estrato')) {
+        return true;
+      }
+
+      // Tiene flecha/chevron y está dentro de un contenedor de formulario
+      const hasChevron = el.querySelector && el.querySelector('.fa-chevron-down, .fa-angle-down, .caret, [class*="arrow"], [class*="chevron"], svg');
+      if (hasChevron && (el.closest('.form-group, .form-field, .col, .field, div') || cls.includes('select') || cls.includes('dropdown'))) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  async _openAndSelectCustomDropdown(triggerEl, targetValueOrRule) {
+    if (!triggerEl) return null;
+
+    // Verificar si ya tiene valor seleccionado (que no sea placeholder "Seleccione...")
+    const currentText = (triggerEl.textContent || triggerEl.value || '').trim();
+    const normCurrent = this._norm(currentText);
+    const isPlaceholder = normCurrent.startsWith('seleccione') || normCurrent.startsWith('seleccionar') ||
+                          normCurrent === '--' || normCurrent === '' || normCurrent.includes('seleccione');
+
+    if (!isPlaceholder && !this.settings.overwrite) {
+      return null;
+    }
+
+    // Despachar ráfaga de eventos de mouse para abrir el menú
+    try {
+      triggerEl.focus?.();
+      triggerEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, composed: true, cancelable: true }));
+      triggerEl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, composed: true, cancelable: true }));
+      triggerEl.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true, cancelable: true }));
+      triggerEl.click?.();
+    } catch {
+      // Fallback
+    }
+
+    // Esperar hasta 500 ms (verificando cada 50 ms) a que aparezca el menú desplegado en el DOM
+    const optionSelectors = [
+      '[role="option"]', 'mat-option', '.ng-option',
+      '.select2-results__option', '.p-dropdown-item', '.ant-select-item-option',
+      '.dropdown-item', '.dropdown-menu li', '.dropdown-menu a', '.dropdown-menu div',
+      'ul.select-options li', '.options-list li', '.menu-item'
+    ];
+
+    let options = [];
+    const startTime = Date.now();
+    const doc = triggerEl.ownerDocument || document;
+
+    while (Date.now() - startTime < 500) {
+      await this._sleep(50);
+      const candidates = Array.from(doc.querySelectorAll(optionSelectors.join(', '))).filter(
+        (opt) => this._isElementVisible(opt) && opt.getAttribute('aria-disabled') !== 'true'
+      );
+
+      if (candidates.length > 0) {
+        options = candidates.filter((opt) => {
+          const t = this._norm(opt.textContent || '');
+          return !t.startsWith('seleccione') && !t.startsWith('seleccionar') && t !== '--' && t !== '';
+        });
+        if (options.length > 0) break;
+      }
+    }
+
+    if (options.length === 0) return null;
+
+    // Buscar la opción deseada
+    let targetOpt = null;
+
+    // 1. Coincidencia específica (si viene de plantilla o dato concreto)
+    if (typeof targetValueOrRule === 'string' && targetValueOrRule.trim()) {
+      const targetNorm = this._norm(targetValueOrRule);
+      targetOpt = options.find((opt) => {
+        const t = this._norm(opt.textContent || '');
+        return t === targetNorm || t.includes(targetNorm) || targetNorm.includes(t);
+      });
+    }
+
+    // 2. Coincidencia en lista neutra
+    if (!targetOpt) {
+      for (const pref of this.settings.neutralOptions) {
+        const pNorm = this._norm(pref);
+        targetOpt = options.find((opt) => {
+          const t = this._norm(opt.textContent || '');
+          return t === pNorm || t.includes(pNorm);
+        });
+        if (targetOpt) break;
+      }
+    }
+
+    // 3. Regla de Oro: Primera opción válida disponible
+    if (!targetOpt && options.length > 0) {
+      targetOpt = options[0];
+    }
+
+    if (targetOpt) {
+      const selectedText = targetOpt.textContent.trim();
+      try {
+        targetOpt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, composed: true, cancelable: true }));
+        targetOpt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, composed: true, cancelable: true }));
+        targetOpt.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true, cancelable: true }));
+        targetOpt.click?.();
+      } catch {
+        // Fallback
+      }
+
+      // Notificar al componente del cambio
+      triggerEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      triggerEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+
+      // Pausa obligatoria de 200 ms para que no se pisen desplegables consecutivos
+      await this._sleep(200);
+      return selectedText;
+    }
+
+    return null;
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     3. SETTERS NATIVOS Y CLICS SEGUROS (Checkboxes / Radios)
+     ══════════════════════════════════════════════════════════════ */
 
   _setNativeValue(element, value) {
-    const setter = this._getPrototypeSetter(element);
-    if (setter) {
-      setter.call(element, value);
+    if (this._isBlockedOrReadonly(element)) return;
+
+    const strVal = value == null ? '' : String(value);
+    const tag = element.tagName;
+    let setter = null;
+
+    if (tag === 'SELECT') {
+      setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+    } else if (tag === 'TEXTAREA') {
+      setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
     } else {
-      element.value = value;
+      setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
     }
-    // Despachar eventos en orden para frameworks reactivos
-    element.dispatchEvent(new Event('focus', { bubbles: true }));
-    element.dispatchEvent(new Event('input', { bubbles: true }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
-    element.dispatchEvent(new Event('blur', { bubbles: true }));
+
+    if (setter) {
+      setter.call(element, strVal);
+    } else {
+      element.value = strVal;
+    }
+
+    element.dispatchEvent(new Event('focus', { bubbles: true, composed: true }));
+    element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    element.dispatchEvent(new Event('blur', { bubbles: true, composed: true }));
   }
 
-  _setChecked(element, checked) {
-    if (element.checked === checked) return;
-    element.checked = checked;
-    element.dispatchEvent(new Event('click', { bubbles: true }));
-    element.dispatchEvent(new Event('input', { bubbles: true }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
+  _toggleStyledControl(element, targetChecked) {
+    if (this._isBlockedOrReadonly(element)) return;
+
+    const shouldCheck = Boolean(targetChecked);
+    if (element.checked === shouldCheck) return;
+
+    // 1. Hacer clic sobre el <label> asociado si existe (necesario para frameworks reactivos)
+    const label = this._getAssociatedLabel(element);
+    if (label && label !== element) {
+      try {
+        label.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true, cancelable: true }));
+      } catch {
+        label.click?.();
+      }
+    }
+
+    // 2. Si no cambió, hacer clic directo al input
+    if (element.checked !== shouldCheck) {
+      try {
+        element.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true, cancelable: true }));
+      } catch {
+        element.click?.();
+      }
+    }
+
+    // 3. Forzar el setter nativo del prototipo si sigue sin cambiar
+    if (element.checked !== shouldCheck) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked')?.set;
+      if (setter) {
+        setter.call(element, shouldCheck);
+      } else {
+        element.checked = shouldCheck;
+      }
+    }
+
+    element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
   }
 
-  _selectOption(selectEl, value) {
-    // Para <select> nativos
-    const option = Array.from(selectEl.options).find(
-      (o) => o.value === value || o.textContent.trim() === value
-    );
-    if (option) {
-      selectEl.selectedIndex = option.index;
-      this._setNativeValue(selectEl, option.value);
+  _selectNativeOption(selectEl, valueOrText) {
+    if (this._isBlockedOrReadonly(selectEl)) return false;
+
+    const options = Array.from(selectEl.options);
+    const target = options.find((o) => o.value === valueOrText || this._norm(o.textContent) === this._norm(valueOrText));
+
+    if (target) {
+      selectEl.selectedIndex = target.index;
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+      if (setter) setter.call(selectEl, target.value);
+      else selectEl.value = target.value;
+
+      selectEl.dispatchEvent(new Event('focus', { bubbles: true, composed: true }));
+      selectEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      selectEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      selectEl.dispatchEvent(new Event('blur', { bubbles: true, composed: true }));
       return true;
     }
     return false;
   }
 
-  /* ═══════════════════════════════════════════
-     DETECCIÓN DE CONTEXTO DE CAMPO
-     ═══════════════════════════════════════════ */
+  /* ══════════════════════════════════════════════════════════════
+     4. CONTEXTO Y HEURÍSTICAS DE TEXTO
+     ══════════════════════════════════════════════════════════════ */
 
   _getFieldContext(field) {
     const ctx = {
       element: field,
-      tag: field.tagName.toLowerCase(),
+      tag: (field.tagName || '').toLowerCase(),
       type: (field.type || '').toLowerCase(),
       id: field.id || '',
       name: field.name || '',
@@ -107,54 +447,58 @@ class AutofillEngine {
       nearbyText: '',
       options: [],
       role: field.getAttribute('role') || '',
-      classList: Array.from(field.classList),
     };
 
-    // Buscar label asociada
-    if (field.id) {
-      const lbl = document.querySelector(`label[for="${CSS.escape(field.id)}"]`);
-      if (lbl) ctx.label = lbl.textContent.trim();
-    }
-    if (!ctx.label) {
-      const parentLabel = field.closest('label');
-      if (parentLabel) {
-        // Texto del label sin el texto de los hijos que son inputs
-        const clone = parentLabel.cloneNode(true);
-        clone.querySelectorAll('input, select, textarea').forEach((e) => e.remove());
-        ctx.label = clone.textContent.trim();
-      }
+    // Label asociado
+    const lbl = this._getAssociatedLabel(field);
+    if (lbl) {
+      const clone = lbl.cloneNode(true);
+      clone.querySelectorAll('input, select, textarea').forEach((e) => e.remove());
+      ctx.label = clone.textContent.trim();
     }
 
-    // aria-label y aria-labelledby
+    // aria-labelledby
     if (!ctx.label && field.getAttribute('aria-labelledby')) {
-      const lblId = field.getAttribute('aria-labelledby');
-      const lblEl = document.getElementById(lblId);
-      if (lblEl) ctx.label = lblEl.textContent.trim();
-    }
-
-    // Texto cercano (hermanos del padre)
-    const parent = field.closest('.form-group, .form-field, .field, .col, .column, td, th, div');
-    if (parent) {
-      const textContent = [];
-      for (const node of parent.childNodes) {
-        if (node.nodeType === Node.TEXT_NODE) textContent.push(node.textContent.trim());
-        if (node.nodeType === Node.ELEMENT_NODE && ['LABEL', 'SPAN', 'P', 'STRONG', 'B'].includes(node.tagName)) {
-          textContent.push(node.textContent.trim());
-        }
+      const doc = field.ownerDocument || document;
+      const lblIds = field.getAttribute('aria-labelledby').split(/\s+/);
+      const textParts = [];
+      for (const id of lblIds) {
+        const lblEl = doc.getElementById(id);
+        if (lblEl) textParts.push(lblEl.textContent.trim());
       }
-      ctx.nearbyText = textContent.filter(Boolean).join(' ');
+      if (textParts.length > 0) ctx.label = textParts.join(' ');
     }
 
-    // Opciones de <select>
+    // Texto de contenedor cercano / fieldset
+    if (field.closest) {
+      const fieldset = field.closest('fieldset');
+      if (fieldset) {
+        const legend = fieldset.querySelector('legend');
+        if (legend) ctx.nearbyText += ' ' + legend.textContent.trim();
+      }
+
+      const parent = field.closest('.form-group, .form-field, .field, .col, .column, td, th, div');
+      if (parent) {
+        const textContent = [];
+        for (const node of parent.childNodes) {
+          if (node.nodeType === Node.TEXT_NODE) textContent.push(node.textContent.trim());
+          if (node.nodeType === Node.ELEMENT_NODE && ['LABEL', 'SPAN', 'P', 'STRONG', 'B'].includes(node.tagName)) {
+            textContent.push(node.textContent.trim());
+          }
+        }
+        ctx.nearbyText += ' ' + textContent.filter(Boolean).join(' ');
+      }
+    }
+
+    // Opciones para <select> nativo
     if (ctx.tag === 'select') {
-      ctx.options = Array.from(field.options).map((o) => ({
+      ctx.options = Array.from(field.options || []).map((o) => ({
         value: o.value,
         text: o.textContent.trim(),
         disabled: o.disabled,
       }));
     }
 
-    // Texto de búsqueda combinado
     ctx.searchText = [
       ctx.label, ctx.placeholder, ctx.ariaLabel,
       ctx.name, ctx.id, ctx.nearbyText
@@ -163,12 +507,12 @@ class AutofillEngine {
     return ctx;
   }
 
-  /* ═══════════════════════════════════════════
-     UTILIDADES DE MATCHING
-     ═══════════════════════════════════════════ */
-
   _norm(str) {
-    return (str || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    return (str || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .trim();
   }
 
   _matches(ctx, keywords) {
@@ -177,31 +521,49 @@ class AutofillEngine {
   }
 
   _hasValue(field) {
-    if (field.tagName === 'SELECT') {
+    if (!field) return false;
+    const tag = field.tagName.toLowerCase();
+
+    if (tag === 'select') {
       const val = field.value;
       const text = field.options[field.selectedIndex]?.textContent?.trim() || '';
-      return val && val !== '' && val !== '0' &&
-        !['seleccione', 'seleccione...', '--', '---', 'seleccionar', '-- seleccione --']
-          .includes(this._norm(text));
+      return Boolean(
+        val && val !== '' && val !== '0' && val !== '-1' &&
+        !this._isPlaceholderOption({ value: val, text })
+      );
     }
-    if (field.type === 'checkbox' || field.type === 'radio') return field.checked;
-    return field.value && field.value.trim() !== '';
+
+    if (field.type === 'checkbox' || field.type === 'radio') {
+      return field.checked || field.getAttribute('aria-checked') === 'true';
+    }
+
+    // Custom dropdowns
+    if (this._isCustomDropdownElement(field)) {
+      const text = this._norm(field.textContent || field.value || '');
+      if (text && !text.startsWith('seleccione') && !text.startsWith('seleccionar') && text !== '--') {
+        return true;
+      }
+      return false;
+    }
+
+    return field.value != null && field.value.trim() !== '';
   }
 
   _isPlaceholderOption(opt) {
     const v = (opt.value || '').trim();
     const t = this._norm(opt.text);
-    return !v || v === '0' || v === '-1' || v === 'null' || v === 'undefined' ||
-      ['seleccione', 'seleccione...', '--', '---', 'seleccionar', '-- seleccione --',
-       'elegir', 'escoja', 'opcion', 'seleccionar...', ''].includes(t) ||
-      opt.disabled;
+    return (
+      !v || v === '0' || v === '-1' || v === 'null' || v === 'undefined' ||
+      t.startsWith('seleccione') || t.startsWith('seleccionar') ||
+      ['--', '---', 'elegir', 'escoja', 'opcion', ''].includes(t) ||
+      Boolean(opt.disabled)
+    );
   }
 
   _findBestOption(ctx, preferredValues) {
-    const validOpts = ctx.options.filter((o) => !this._isPlaceholderOption(o));
+    const validOpts = (ctx.options || []).filter((o) => !this._isPlaceholderOption(o));
     if (validOpts.length === 0) return null;
 
-    // Buscar coincidencia exacta con valores preferidos
     for (const pref of preferredValues) {
       const np = this._norm(pref);
       const exact = validOpts.find(
@@ -210,7 +572,6 @@ class AutofillEngine {
       if (exact) return exact.value;
     }
 
-    // Buscar coincidencia parcial (contiene)
     for (const pref of preferredValues) {
       const np = this._norm(pref);
       if (np.length < 2) continue;
@@ -223,15 +584,17 @@ class AutofillEngine {
     return null;
   }
 
-  /* ═══════════════════════════════════════════
-     DETERMINACIÓN DE VALOR
-     ═══════════════════════════════════════════ */
+  _getFirstValidOption(ctx) {
+    const valid = (ctx.options || []).find((o) => !this._isPlaceholderOption(o));
+    return valid ? valid.value : null;
+  }
 
-  _determineValue(ctx, patient, opts) {
+  /* ══════════════════════════════════════════════════════════════
+     5. FASE 1: VALORES DEL PACIENTE (EXCEL) Y FAMILIA UNIPERSONAL
+     ══════════════════════════════════════════════════════════════ */
+
+  _determinePhase1Value(ctx, patient, opts) {
     const tag = ctx.tag;
-    const type = ctx.type;
-
-    // ── 1. DATOS DEL PACIENTE (match por contexto) ──
 
     // Nombre completo
     if (this._matches(ctx, ['nombre completo', 'nombre del usuario', 'nombre usuario', 'full name', 'nombre_completo'])) {
@@ -239,10 +602,8 @@ class AutofillEngine {
     }
 
     // Primer nombre
-    if (this._matches(ctx, ['primer nombre', 'first name', 'primer_nombre', 'nombres', 'name1'])) {
-      if (this._matches(ctx, ['segundo', 'second', '2'])) {
-        return patient.segundoNombre || '';
-      }
+    if (this._matches(ctx, ['primer nombre', 'first name', 'primer_nombre', 'name1'])) {
+      if (this._matches(ctx, ['segundo', 'second', '2'])) return patient.segundoNombre || '';
       return patient.primerNombre || '';
     }
 
@@ -252,13 +613,18 @@ class AutofillEngine {
     }
 
     // Primer apellido
-    if (this._matches(ctx, ['primer apellido', 'apellido paterno', 'last name', 'primer_apellido', 'apellido1', 'apellido 1'])) {
+    if (this._matches(ctx, ['primer apellido', 'apellido paterno', 'last name', 'primer_apellido', 'apellido1'])) {
       return patient.primerApellido || '';
     }
 
     // Segundo apellido
-    if (this._matches(ctx, ['segundo apellido', 'apellido materno', 'segundo_apellido', 'apellido2', 'apellido 2'])) {
+    if (this._matches(ctx, ['segundo apellido', 'apellido materno', 'segundo_apellido', 'apellido2'])) {
       return patient.segundoApellido || '';
+    }
+
+    // Nombres (general)
+    if (this._matches(ctx, ['nombres']) && !this._matches(ctx, ['apellido'])) {
+      return [patient.primerNombre, patient.segundoNombre].filter(Boolean).join(' ') || patient.nombreCompleto || '';
     }
 
     // Apellidos (campo combinado)
@@ -267,7 +633,7 @@ class AutofillEngine {
     }
 
     // Tipo de documento
-    if (this._matches(ctx, ['tipo de documento', 'tipo documento', 'tipo id', 'tipo_id', 'tipo_documento', 'doc type', 'tipo identificacion'])) {
+    if (this._matches(ctx, ['tipo de documento', 'tipo documento', 'tipo id', 'tipo_id', 'tipo_documento', 'tipo identificacion'])) {
       if (tag === 'select') {
         return this._findBestOption(ctx, [patient.tipoId, this._expandTipoId(patient.tipoId)]);
       }
@@ -275,8 +641,10 @@ class AutofillEngine {
     }
 
     // Número de documento / cédula
-    if (this._matches(ctx, ['numero de documento', 'numero documento', 'numero id', 'numero_id', 'cedula', 'identificacion', 'nro documento',
-                             'num documento', 'documento', 'doc number', 'numero_documento', 'no. documento', 'n documento', 'nro. identificacion'])) {
+    if (this._matches(ctx, [
+      'numero de documento', 'numero documento', 'numero id', 'numero_id', 'cedula',
+      'identificacion', 'nro documento', 'num documento', 'documento', 'numero_documento'
+    ])) {
       return patient.numeroId || '';
     }
 
@@ -285,17 +653,17 @@ class AutofillEngine {
       return patient.direccion || 'Sin dirección registrada';
     }
 
-    // Teléfono
+    // Teléfono / Celular
     if (this._matches(ctx, ['telefono', 'celular', 'phone', 'tel.', 'movil', 'contacto'])) {
-      return patient.telefono || '';
+      return patient.telefono || '3000000000';
     }
 
-    // Barrio / Vereda
-    if (this._matches(ctx, ['barrio', 'vereda', 'neighborhood', 'localidad', 'sector', 'comuna'])) {
+    // Barrio / Vereda / Sector
+    if (this._matches(ctx, ['barrio', 'vereda', 'localidad', 'sector', 'corregimiento'])) {
       if (tag === 'select') {
         return this._findBestOption(ctx, [patient.barrio]);
       }
-      return patient.barrio || '';
+      return patient.barrio || 'CENTRO';
     }
 
     // Departamento
@@ -307,7 +675,7 @@ class AutofillEngine {
     }
 
     // Municipio / Ciudad
-    if (this._matches(ctx, ['municipio', 'ciudad', 'city', 'municipality', 'poblacion'])) {
+    if (this._matches(ctx, ['municipio', 'ciudad', 'city', 'municipality'])) {
       if (tag === 'select') {
         return this._findBestOption(ctx, [patient.municipio]);
       }
@@ -323,96 +691,148 @@ class AutofillEngine {
     }
 
     // Fecha
-    if (this._matches(ctx, ['fecha', 'date', 'fch'])) {
-      if (type === 'date') {
-        return patient.fecha || this._todayISO();
-      }
+    if (this._matches(ctx, ['fecha', 'date', 'fch']) && !this._matches(ctx, ['visita', 'atencion'])) {
       return patient.fecha || this._todayISO();
     }
 
-    // Discapacidad
-    if (this._matches(ctx, ['discapacidad', 'disability', 'condicion discapacidad'])) {
-      if (tag === 'select') {
-        const val = patient.discapacidad || '';
-        return this._findBestOption(ctx, [val, 'No', 'Ninguna', 'No aplica', 'Sin discapacidad']);
-      }
-      return patient.discapacidad || 'No';
-    }
-
-    // Adulto mayor
-    if (this._matches(ctx, ['adulto mayor', 'persona mayor', 'tercera edad', 'senior'])) {
-      if (tag === 'select') {
-        return this._findBestOption(ctx, [patient.adultoMayor, 'No', 'No aplica']);
-      }
-      return patient.adultoMayor || 'No';
-    }
-
-    // ── 2. REGLAS FAMILIA UNIPERSONAL ──
-
+    // Familia Unipersonal
     if (opts.familiaUnipersonal) {
-      // Número de integrantes / personas / miembros
-      if (this._matches(ctx, ['integrantes', 'personas', 'miembros', 'num personas', 'numero personas',
-                               'total personas', 'total integrantes', 'miembros hogar', 'habitantes'])) {
+      if (this._matches(ctx, ['integrantes', 'personas', 'miembros', 'num personas', 'numero personas', 'total personas', 'total integrantes', 'miembros hogar', 'habitantes'])) {
         return '1';
       }
-
-      // Tipo de familia
       if (this._matches(ctx, ['tipo de familia', 'tipo familia', 'composicion familiar', 'tipo_familia', 'tipologia familiar'])) {
-        if (tag === 'select') {
-          return this._findBestOption(ctx, ['Unipersonal', 'Persona sola', 'Individual']);
-        }
+        if (tag === 'select') return this._findBestOption(ctx, ['Unipersonal', 'Persona sola', 'Individual']);
         return 'Unipersonal';
       }
-
-      // Parentesco
       if (this._matches(ctx, ['parentesco', 'relacion', 'parentesco familiar', 'vinculo', 'relacion familiar'])) {
-        if (tag === 'select') {
-          return this._findBestOption(ctx, ['Jefe de hogar', 'Jefe del hogar', 'Jefe(a) de hogar', 'Jefe', 'Cabeza de familia', 'Cabeza de hogar']);
-        }
+        if (tag === 'select') return this._findBestOption(ctx, ['Jefe de hogar', 'Jefe del hogar', 'Jefe(a) de hogar', 'Jefe']);
         return 'Jefe de hogar';
       }
-    }
-
-    // ── 3. CAMPOS ASUMIDOS (NO del Excel) ──
-
-    if (tag === 'select') {
-      return this._findBestOption(ctx, this.settings.neutralOptions) ||
-        this._getFirstValidOption(ctx);
-    }
-
-    if (type === 'number') {
-      return this._getDefaultNumber(ctx);
-    }
-
-    if (type === 'date') {
-      return this._todayISO();
-    }
-
-    if (type === 'checkbox') {
-      return null; // No marcar checkboxes desconocidos por defecto
-    }
-
-    if (type === 'radio') {
-      return null; // Se manejan en grupo
-    }
-
-    if (tag === 'textarea' || (tag === 'input' && ['text', 'search', 'url', 'email', ''].includes(type))) {
-      if (ctx.minlength >= 10 || this._matches(ctx, ['observacion', 'descripcion', 'comentario', 'nota', 'detalle', 'justificacion', 'motivo'])) {
-        return this._generateDefaultText(ctx);
-      }
-      // Campo de texto genérico corto
-      if (ctx.required) {
-        return this._generateDefaultText(ctx);
-      }
-      return null; // No llenar campos opcionales desconocidos
     }
 
     return null;
   }
 
-  /* ═══════════════════════════════════════════
-     HELPERS DE VALORES POR DEFECTO
-     ═══════════════════════════════════════════ */
+  /* ══════════════════════════════════════════════════════════════
+     6. FASE 2: BARRIDO UNIVERSAL DE CAMPOS ASUMIDOS
+     ══════════════════════════════════════════════════════════════ */
+
+  _determinePhase2Value(ctx, patient) {
+    const tag = ctx.tag;
+    const type = ctx.type;
+    const normLabel = this._norm(ctx.label || ctx.name || ctx.placeholder || '');
+
+    // 1. Select nativo (<select>)
+    if (tag === 'select') {
+      const best = this._findBestOption(ctx, this.settings.neutralOptions);
+      if (best !== null) return best;
+      return this._getFirstValidOption(ctx);
+    }
+
+    // 2. Input numérico
+    if (type === 'number') {
+      return this._getDefaultNumberWithHeuristics(ctx);
+    }
+
+    // 3. Fechas
+    if (type === 'date' || type === 'datetime-local') {
+      return patient.fecha || this._todayISO();
+    }
+
+    // 4. Inputs de texto y textareas
+    if (tag === 'textarea' || (tag === 'input' && ['text', 'search', 'url', 'email', 'tel', ''].includes(type))) {
+
+      // A) Campos de ubicación / nombres cortos de lugar (NO poner observaciones largas)
+      if (normLabel.includes('ubicacion') || normLabel.includes('barrio') ||
+          normLabel.includes('vereda') || normLabel.includes('sector') ||
+          normLabel.includes('corregimiento') || normLabel.includes('nombre tipo de ubicacion')) {
+        return patient.barrio || patient.direccion || 'CENTRO';
+      }
+
+      // B) Correo
+      if (type === 'email' || normLabel.includes('correo') || normLabel.includes('email')) {
+        return 'notiene@correo.com';
+      }
+
+      // C) Teléfono / celular
+      if (type === 'tel' || normLabel.includes('telefono') || normLabel.includes('celular') || normLabel.includes('movil')) {
+        return patient.telefono || '3000000000';
+      }
+
+      // D) Patrón numérico
+      if (ctx.pattern && (/^\^?\\d\+\$?/.test(ctx.pattern) || /^\^?\[0-9\]\+\$?/.test(ctx.pattern))) {
+        const len = ctx.minlength > 0 ? ctx.minlength : (ctx.maxlength < 10 ? ctx.maxlength : 10);
+        return '1234567890'.substring(0, len) || '1';
+      }
+
+      // E) Frase larga / Observaciones:
+      // Reservada EXCLUSIVAMENTE para textareas o campos con "observacion", "detalle", "descripcion", etc.
+      const isExplicitObservation = tag === 'textarea' ||
+        normLabel.includes('observacion') || normLabel.includes('detalle') ||
+        normLabel.includes('descripcion') || normLabel.includes('motivo') ||
+        normLabel.includes('comentario') || normLabel.includes('nota') ||
+        normLabel.includes('justificacion');
+
+      if (isExplicitObservation) {
+        return this._generateCompliantText(ctx);
+      }
+
+      // F) Input corto con minlength >= 10 pero NO de ubicación
+      if (ctx.minlength >= 10) {
+        return this._generateCompliantText(ctx);
+      }
+
+      // G) Campo de texto corto obligatorio
+      if (ctx.required) {
+        return this.settings.defaultTexts.short || 'No aplica.';
+      }
+    }
+
+    return null;
+  }
+
+  _generateCompliantText(ctx) {
+    const minLen = Math.max(ctx.minlength || 0, 10);
+    const maxLen = ctx.maxlength === Infinity ? 500 : (ctx.maxlength || 500);
+
+    let text = this.settings.defaultTexts.long || 'No refiere novedades durante la caracterización.';
+
+    if (text.length < minLen) {
+      const ext = ' Sin antecedentes ni novedades adicionales al momento de la visita.';
+      while (text.length < minLen) text += ext;
+    }
+
+    if (text.length > maxLen) {
+      text = text.substring(0, maxLen);
+      if (text.length > 2) text = text.replace(/[,; ]$/, '') + '.';
+    }
+
+    return text;
+  }
+
+  _getDefaultNumberWithHeuristics(ctx) {
+    const min = ctx.min !== '' ? parseFloat(ctx.min) : 0;
+    const max = ctx.max !== '' ? parseFloat(ctx.max) : 999999;
+    const step = parseFloat(ctx.step) || 1;
+
+    let target = 1;
+
+    if (this._matches(ctx, ['integrantes', 'personas', 'miembros', 'habitantes'])) target = 1;
+    else if (this._matches(ctx, ['habitaciones', 'cuartos', 'piezas', 'alcobas'])) target = 2;
+    else if (this._matches(ctx, ['edad', 'anos', 'anios', 'age'])) target = 30;
+    else if (this._matches(ctx, ['peso', 'kg'])) target = 65;
+    else if (this._matches(ctx, ['talla', 'estatura', 'altura', 'cm'])) target = 165;
+    else if (min > 0) target = min;
+
+    if (target < min) target = min;
+    if (target > max) target = max;
+
+    if (step > 0 && step !== 1) {
+      target = Math.round(target / step) * step;
+    }
+
+    return String(target);
+  }
 
   _expandTipoId(code) {
     const map = {
@@ -434,264 +854,556 @@ class AutofillEngine {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }
 
-  _getFirstValidOption(ctx) {
-    const valid = ctx.options.find((o) => !this._isPlaceholderOption(o));
-    return valid ? valid.value : null;
-  }
-
-  _getDefaultNumber(ctx) {
-    // Si es campo de integrantes/personas, poner 1
-    if (this._matches(ctx, ['integrantes', 'personas', 'miembros', 'habitantes'])) return '1';
-
-    const min = parseFloat(ctx.min) || 0;
-    const max = parseFloat(ctx.max) || 999999;
-    const step = parseFloat(ctx.step) || 1;
-
-    // Usar el mínimo válido
-    let val = Math.max(min, 0);
-    if (val === 0 && min > 0) val = min;
-    if (val > max) val = max;
-
-    // Ajustar al step
-    if (step > 0) {
-      val = Math.ceil(val / step) * step;
-      if (val > max) val = Math.floor(max / step) * step;
-    }
-
-    return val.toString();
-  }
-
-  _generateDefaultText(ctx) {
-    const minLen = Math.max(ctx.minlength || 0, 1);
-    const maxLen = ctx.maxlength === Infinity ? 500 : (ctx.maxlength || 500);
-
-    const templates = [
-      'Sin observaciones adicionales.',
-      'No refiere novedades al momento.',
-      'No aplica para este caso.',
-      'Sin información adicional por reportar.',
-      'Paciente sin novedades relevantes al momento de la valoración.',
-    ];
-
-    // Buscar una que encaje
-    for (const t of templates) {
-      if (t.length >= minLen && t.length <= maxLen) return t;
-    }
-
-    // Construir una que encaje
-    let text = this.settings.defaultTexts.long;
-    if (text.length < minLen) {
-      while (text.length < minLen) {
-        text += ' No refiere novedades adicionales.';
-      }
-    }
-    if (text.length > maxLen) {
-      text = text.substring(0, maxLen - 1) + '.';
-    }
-    return text;
-  }
-
-  /* ═══════════════════════════════════════════
-     MANEJO DE RADIOS EN GRUPO
-     ═══════════════════════════════════════════ */
-
-  _handleRadioGroups(patient, opts) {
-    const results = [];
-    const processed = new Set();
-
-    document.querySelectorAll('input[type="radio"]:not([disabled])').forEach((radio) => {
-      if (processed.has(radio.name)) return;
-      processed.add(radio.name);
-
-      if (!opts.overwrite) {
-        const group = document.querySelectorAll(`input[type="radio"][name="${CSS.escape(radio.name)}"]`);
-        const anyChecked = Array.from(group).some((r) => r.checked);
-        if (anyChecked) return;
-      }
-
-      const group = Array.from(
-        document.querySelectorAll(`input[type="radio"][name="${CSS.escape(radio.name)}"]`)
-      );
-
-      // Intentar determinar qué pide este grupo
-      const ctx = this._getFieldContext(radio);
-
-      // Buscar el radio con valor neutral/negativo
-      let target = null;
-
-      // Primero verificar si es un campo de datos del paciente
-      if (this._matches(ctx, ['tipo de documento', 'tipo documento', 'tipo id'])) {
-        target = group.find((r) => {
-          const lbl = this._getRadioLabel(r);
-          return this._norm(lbl).includes(this._norm(patient.tipoId)) ||
-            this._norm(lbl).includes(this._norm(this._expandTipoId(patient.tipoId)));
-        });
-      }
-
-      // Si es campo asumido, buscar opción neutral
-      if (!target) {
-        for (const pref of this.settings.neutralOptions) {
-          target = group.find((r) => {
-            const lbl = this._getRadioLabel(r);
-            return this._norm(lbl) === this._norm(pref);
-          });
-          if (target) break;
-        }
-      }
-
-      // Si no hay neutral, seleccionar la primera opción
-      if (!target && group.length > 0) {
-        target = group[0];
-      }
-
-      if (target) {
-        this._setChecked(target, true);
-        results.push({ field: target, context: ctx, value: target.value });
-      }
-    });
-
-    return results;
-  }
-
-  _getRadioLabel(radio) {
-    if (radio.id) {
-      const lbl = document.querySelector(`label[for="${CSS.escape(radio.id)}"]`);
-      if (lbl) return lbl.textContent.trim();
-    }
-    const parentLabel = radio.closest('label');
-    if (parentLabel) {
-      const clone = parentLabel.cloneNode(true);
-      clone.querySelectorAll('input').forEach((e) => e.remove());
-      return clone.textContent.trim();
-    }
-    return radio.value || '';
-  }
-
-  /* ═══════════════════════════════════════════
-     SCAN DE CAMPOS VISIBLES
-     ═══════════════════════════════════════════ */
-
-  _scanVisibleFields() {
-    const selectors = [
-      'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]):not([type="image"]):not([type="file"]):not([type="radio"]):not([type="checkbox"]):not([disabled]):not([readonly])',
-      'textarea:not([disabled]):not([readonly])',
-      'select:not([disabled])',
-    ];
-
-    const fields = [];
-    for (const sel of selectors) {
-      document.querySelectorAll(sel).forEach((el) => {
-        // Verificar que sea visible
-        if (this._isVisible(el)) {
-          fields.push(el);
-        }
-      });
-    }
-    return fields;
-  }
-
-  _isVisible(el) {
-    if (!el.offsetParent && el.tagName !== 'BODY' && getComputedStyle(el).position !== 'fixed') {
-      return false;
-    }
-    const style = getComputedStyle(el);
-    return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
-  }
-
-  /* ═══════════════════════════════════════════
-     SELECTS EN CASCADA
-     ═══════════════════════════════════════════ */
-
-  async _handleCascadeSelects(patient, opts, results) {
-    // Esperar a que selects hijos se pueblen tras cambiar padres
-    await this._sleep(350);
-
-    // Segunda pasada: buscar selects vacíos/con placeholder que ahora tengan opciones
-    const selects = Array.from(document.querySelectorAll('select:not([disabled])')).filter(
-      (s) => this._isVisible(s) && !this._hasValue(s)
-    );
-
-    for (const sel of selects) {
-      // Verificar si tiene más opciones que antes (se pobló dinámicamente)
-      if (sel.options.length <= 1) continue;
-
-      const ctx = this._getFieldContext(sel);
-      const value = this._determineValue(ctx, patient, opts);
-      if (value !== null) {
-        this._selectOption(sel, value);
-        this._setNativeValue(sel, value);
-        results.filled.push({ field: sel, context: ctx, value });
-        this._highlightField(sel, 'filled');
-
-        // Esperar por posibles sub-cascadas
-        await this._sleep(300);
-      }
-    }
-
-    // Tercera pasada (para sub-cascadas)
-    await this._sleep(300);
-    const finalSelects = Array.from(document.querySelectorAll('select:not([disabled])')).filter(
-      (s) => this._isVisible(s) && !this._hasValue(s) && s.options.length > 1
-    );
-
-    for (const sel of finalSelects) {
-      const ctx = this._getFieldContext(sel);
-      const value = this._determineValue(ctx, patient, opts);
-      if (value !== null) {
-        this._selectOption(sel, value);
-        this._setNativeValue(sel, value);
-        results.filled.push({ field: sel, context: ctx, value });
-        this._highlightField(sel, 'filled');
-      }
-    }
-  }
-
   _sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  /* ═══════════════════════════════════════════
-     CUSTOM CONTROLS SUPPORT
-     ═══════════════════════════════════════════ */
+  /* ══════════════════════════════════════════════════════════════
+     7. BARRIDO ESPECIALIZADO: RADIOS, CHECKBOXES Y CUSTOM SELECTS
+     ══════════════════════════════════════════════════════════════ */
 
-  _handleCustomControls(patient, opts, results) {
-    // mat-select (Angular Material)
-    document.querySelectorAll('mat-select, [role="combobox"], .ng-select, .select2-container').forEach((el) => {
-      if (!this._isVisible(el)) return;
+  _getControlText(el) {
+    const lbl = this._getAssociatedLabel(el);
+    if (lbl) return lbl.textContent.trim();
+    if (el.parentElement) {
+      const clone = el.parentElement.cloneNode(true);
+      clone.querySelectorAll('input').forEach((i) => i.remove());
+      const t = clone.textContent.trim();
+      if (t) return t;
+    }
+    return el.value || '';
+  }
+
+  _sweepRadioGroups(allFields, opts, results) {
+    const radios = allFields.filter(
+      (el) => (el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'radio') || el.getAttribute('role') === 'radio'
+    );
+
+    const groups = new Map();
+    for (const r of radios) {
+      if (this._isBlockedOrReadonly(r)) continue;
+      let groupKey = r.name;
+      if (!groupKey) {
+        const container = r.closest('fieldset, [role="radiogroup"], .radio-group, .form-group') || r.parentElement;
+        groupKey = container;
+      }
+      if (!groups.has(groupKey)) groups.set(groupKey, []);
+      groups.get(groupKey).push(r);
+    }
+
+    for (const [, group] of groups) {
+      const anyChecked = group.some((r) => r.checked || r.getAttribute('aria-checked') === 'true');
+      if (anyChecked && !opts.overwrite) continue;
+
+      let target = null;
+
+      // 1. Opciones neutras
+      for (const pref of this.settings.neutralOptions) {
+        const np = this._norm(pref);
+        target = group.find((r) => {
+          const lbl = this._norm(this._getControlText(r));
+          const val = this._norm(r.value);
+          return lbl === np || val === np || lbl.includes(np);
+        });
+        if (target) break;
+      }
+
+      // 2. Primera opción habilitada
+      if (!target && group.length > 0) {
+        target = group.find((r) => !this._isBlockedOrReadonly(r)) || group[0];
+      }
+
+      if (target) {
+        this._toggleStyledControl(target, true);
+        this._highlightField(target, 'filled');
+        results.filled.push({ field: target, value: target.value, phase: '2' });
+      }
+    }
+  }
+
+  _sweepCheckboxes(allFields, opts, results) {
+    const checkboxes = allFields.filter(
+      (el) => (el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'checkbox') || el.getAttribute('role') === 'checkbox'
+    );
+
+    const groups = new Map();
+    for (const cb of checkboxes) {
+      if (this._isBlockedOrReadonly(cb)) continue;
+      const container = cb.closest('fieldset, .checkbox-group, .form-group, div') || cb.parentElement;
+      if (!groups.has(container)) groups.set(container, []);
+      groups.get(container).push(cb);
+    }
+
+    for (const [, group] of groups) {
+      const anyChecked = group.some((cb) => cb.checked || cb.getAttribute('aria-checked') === 'true');
+      if (anyChecked && !opts.overwrite) continue;
+
+      // Descartar si es una pregunta condicional tipo "¿Tiene otra ubicación diferente?"
+      const containerText = this._norm(group[0].closest('fieldset, .form-group, div')?.textContent || '');
+      const isConditionalQuestion =
+        containerText.includes('tiene otra') || containerText.includes('¿tiene otra') ||
+        containerText.includes('desea agregar') || containerText.includes('¿desea agregar') ||
+        containerText.includes('presenta otra') || containerText.includes('¿presenta otra') ||
+        containerText.includes('otra ubicacion diferente');
+
+      if (isConditionalQuestion) {
+        // Dejar desmarcados todos los checkboxes condicionales por defecto
+        for (const cb of group) {
+          if (cb.checked) this._toggleStyledControl(cb, false);
+        }
+        continue;
+      }
+
+      if (group.length > 1) {
+        // Buscar opción "No aplica", "Ninguno", "Ninguna" (ej: "4. No aplica")
+        const negativeKeywords = ['no aplica', 'ninguno', 'ninguna', 'no refiere', 'sin novedad', 'ningun'];
+        const negOption = group.find((cb) => {
+          const lbl = this._norm(this._getControlText(cb));
+          const val = this._norm(cb.value);
+          return negativeKeywords.some((kw) => lbl.includes(kw) || val.includes(kw));
+        });
+
+        if (negOption) {
+          // Marcar ÚNICAMENTE la opción negativa y desmarcar las demás
+          for (const cb of group) {
+            this._toggleStyledControl(cb, cb === negOption);
+          }
+          this._highlightField(negOption, 'filled');
+          results.filled.push({ field: negOption, value: negOption.value, phase: '2' });
+          continue;
+        }
+
+        // Si no tiene opción negativa, marcar la primera opción habilitada
+        const first = group.find((cb) => !this._isBlockedOrReadonly(cb)) || group[0];
+        if (first) {
+          this._toggleStyledControl(first, true);
+          this._highlightField(first, 'filled');
+          results.filled.push({ field: first, value: first.value, phase: '2' });
+        }
+      } else {
+        // Checkbox individual único
+        const single = group[0];
+        const ctx = this._getFieldContext(single);
+        const singleLabel = this._norm(this._getControlText(single));
+
+        if (singleLabel.includes('tiene otra') || singleLabel.includes('desea agregar') || singleLabel.includes('presenta otra')) {
+          this._toggleStyledControl(single, false);
+          continue;
+        }
+
+        if (ctx.required || this._matches(ctx, ['acepto', 'consentimiento', 'autorizo', 'confirmo', 'declaracion'])) {
+          this._toggleStyledControl(single, true);
+          this._highlightField(single, 'filled');
+          results.filled.push({ field: single, value: single.value, phase: '2' });
+        }
+      }
+    }
+  }
+
+  async _sweepCustomSelects(allFields, opts, results) {
+    const customSelects = allFields.filter((el) => this._isCustomDropdownElement(el));
+
+    for (const el of customSelects) {
+      if (!opts.overwrite && this._hasValue(el)) continue;
 
       const ctx = this._getFieldContext(el);
-      const value = this._determineValue(ctx, patient, opts);
-      if (value === null) return;
+      const chosenText = await this._openAndSelectCustomDropdown(el, null);
 
-      // Intentar abrir el combobox clickeando
-      el.click();
-      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      if (chosenText) {
+        this._highlightField(el, 'filled');
+        results.filled.push({ field: el, context: ctx, value: chosenText, phase: '2' });
+      }
+    }
+  }
 
-      setTimeout(() => {
-        // Buscar opciones visibles (panel de dropdown)
-        const optionSelectors = [
-          'mat-option', '[role="option"]', '.ng-option', '.select2-results__option'
-        ];
-        for (const sel of optionSelectors) {
-          const opts = document.querySelectorAll(sel);
-          for (const opt of opts) {
-            if (this._norm(opt.textContent).includes(this._norm(value))) {
-              opt.click();
-              results.filled.push({ field: el, context: ctx, value });
-              this._highlightField(el, 'filled');
-              return;
-            }
+  /* ══════════════════════════════════════════════════════════════
+     8. SISTEMA DE PLANTILLAS POR MÓDULO (Grabar y Replicar)
+     ══════════════════════════════════════════════════════════════ */
+
+  detectActiveModuleName() {
+    const knownModules = [
+      'Información General',
+      'Entorno y Vivienda',
+      'Familia',
+      'Integrantes'
+    ];
+
+    const tabSelectors = [
+      '.nav-tabs .active', '.nav-link.active', '.tab.active',
+      '[role="tab"][aria-selected="true"]', 'mat-tab-label-active',
+      '.breadcrumb .active', '.module-title', 'h1', 'h2'
+    ];
+
+    for (const sel of tabSelectors) {
+      const elements = Array.from(document.querySelectorAll(sel));
+      for (const el of elements) {
+        const text = this._norm(el.textContent || '');
+        for (const mod of knownModules) {
+          if (text.includes(this._norm(mod))) {
+            return mod;
           }
         }
-      }, 200);
+      }
+    }
+
+    return 'Información General'; // Módulo por defecto
+  }
+
+  _isPersonalDataField(ctx) {
+    const keywords = [
+      'nombre', 'apellido', 'tipo documento', 'tipo id', 'numero documento',
+      'cedula', 'identificacion', 'direccion', 'telefono', 'celular',
+      'fecha', 'eps', 'aseguradora'
+    ];
+    return this._matches(ctx, keywords);
+  }
+
+  extractModuleSnapshot(moduleName) {
+    const all = this._scanAllInteractiveFields();
+    const fields = [];
+
+    for (const el of all) {
+      if (this._isBlockedOrReadonly(el)) continue;
+
+      const ctx = this._getFieldContext(el);
+      const label = ctx.label || ctx.name || ctx.id;
+      if (!label) continue;
+
+      const normLabel = this._norm(label);
+      const isPersonal = this._isPersonalDataField(ctx);
+
+      // 1. Select nativo
+      if (ctx.tag === 'select') {
+        const optText = el.options[el.selectedIndex]?.textContent?.trim() || '';
+        const optVal = el.value || '';
+        if (optVal && !this._isPlaceholderOption({ value: optVal, text: optText })) {
+          fields.push({
+            type: 'select',
+            label,
+            normLabel,
+            value: optVal,
+            text: optText,
+            isPersonalData: isPersonal,
+          });
+        }
+        continue;
+      }
+
+      // 2. Custom dropdown
+      if (this._isCustomDropdownElement(el)) {
+        const text = (el.textContent || el.value || '').trim();
+        if (text && !this._norm(text).startsWith('seleccione') && text !== '--') {
+          fields.push({
+            type: 'custom-select',
+            label,
+            normLabel,
+            text,
+            isPersonalData: isPersonal,
+          });
+        }
+        continue;
+      }
+
+      // 3. Radio
+      if (ctx.type === 'radio' && el.checked) {
+        fields.push({
+          type: 'radio',
+          groupName: el.name,
+          label,
+          normLabel,
+          optionText: this._getControlText(el),
+          value: el.value,
+          isPersonalData: isPersonal,
+        });
+        continue;
+      }
+
+      // 4. Checkbox
+      if (ctx.type === 'checkbox') {
+        fields.push({
+          type: 'checkbox',
+          label,
+          normLabel,
+          optionText: this._getControlText(el),
+          checked: el.checked,
+          isPersonalData: isPersonal,
+        });
+        continue;
+      }
+
+      // 5. Input text / number / textarea
+      if (['input', 'textarea'].includes(ctx.tag)) {
+        const val = (el.value || '').trim();
+        if (val) {
+          fields.push({
+            type: 'input',
+            tag: ctx.tag,
+            inputType: ctx.type,
+            label,
+            normLabel,
+            value: val,
+            isPersonalData: isPersonal,
+          });
+        }
+      }
+    }
+
+    return {
+      moduleName,
+      savedAt: new Date().toISOString(),
+      fieldCount: fields.length,
+      fields,
+    };
+  }
+
+  async applyModuleTemplate(template, patient, options = {}) {
+    const opts = { ...this.settings, ...options };
+    const results = { filled: [], unresolved: [], skipped: [] };
+    const all = this._scanAllInteractiveFields();
+
+    if (!template || !template.fields) {
+      return this.fillForm(patient, options);
+    }
+
+    this._clearHighlights();
+
+    // 1. Aplicar campos guardados de la plantilla
+    for (const saved of template.fields) {
+      // Buscar el elemento interactivo correspondiente en la pantalla por su label normalizado
+      const el = all.find((field) => {
+        if (this._isBlockedOrReadonly(field)) return false;
+        const ctx = this._getFieldContext(field);
+        return this._norm(ctx.label || ctx.name || ctx.id) === saved.normLabel;
+      });
+
+      if (!el) continue;
+      const ctx = this._getFieldContext(el);
+
+      // Si es dato personal del paciente, sobreescribir dinámicamente con los datos activos del Excel
+      if (saved.isPersonalData) {
+        const patientVal = this._determinePhase1Value(ctx, patient, opts);
+        if (patientVal) {
+          if (ctx.tag === 'select') {
+            this._selectNativeOption(el, patientVal);
+          } else if (this._isCustomDropdownElement(el)) {
+            await this._openAndSelectCustomDropdown(el, patientVal);
+          } else {
+            this._setNativeValue(el, patientVal);
+          }
+          this._highlightField(el, 'filled');
+          results.filled.push({ field: el, value: patientVal, source: 'patient-dynamic' });
+        }
+        continue;
+      }
+
+      // Aplicar valor estático asumido de la plantilla
+      if (saved.type === 'select') {
+        this._selectNativeOption(el, saved.text || saved.value);
+        this._highlightField(el, 'filled');
+        results.filled.push({ field: el, value: saved.text, source: 'template' });
+      } else if (saved.type === 'custom-select') {
+        const chosen = await this._openAndSelectCustomDropdown(el, saved.text);
+        if (chosen) {
+          this._highlightField(el, 'filled');
+          results.filled.push({ field: el, value: chosen, source: 'template' });
+        }
+      } else if (saved.type === 'radio' && saved.optionText) {
+        const doc = el.ownerDocument || document;
+        const radios = Array.from(doc.querySelectorAll(`input[type="radio"][name="${CSS.escape(el.name)}"]`));
+        const match = radios.find((r) => this._norm(this._getControlText(r)) === this._norm(saved.optionText));
+        if (match) {
+          this._toggleStyledControl(match, true);
+          this._highlightField(match, 'filled');
+          results.filled.push({ field: match, value: saved.optionText, source: 'template' });
+        }
+      } else if (saved.type === 'checkbox') {
+        this._toggleStyledControl(el, Boolean(saved.checked));
+        if (saved.checked) this._highlightField(el, 'filled');
+        results.filled.push({ field: el, value: saved.checked, source: 'template' });
+      } else if (saved.type === 'input') {
+        this._setNativeValue(el, saved.value);
+        this._highlightField(el, 'filled');
+        results.filled.push({ field: el, value: saved.value, source: 'template' });
+      }
+    }
+
+    // 2. Correr Fase 1 (Excel) para asegurar que cualquier campo del paciente no mapeado en plantilla se complete
+    for (const el of all) {
+      if (this._isBlockedOrReadonly(el) || this._hasValue(el)) continue;
+      const ctx = this._getFieldContext(el);
+      const val1 = this._determinePhase1Value(ctx, patient, opts);
+      if (val1) {
+        if (ctx.tag === 'select') this._selectNativeOption(el, val1);
+        else if (this._isCustomDropdownElement(el)) await this._openAndSelectCustomDropdown(el, val1);
+        else this._setNativeValue(el, val1);
+        this._highlightField(el, 'filled');
+        results.filled.push({ field: el, value: val1, source: 'phase1' });
+      }
+    }
+
+    // 3. Correr Fase 2 solo sobre campos que sigan vacíos tras aplicar la plantilla
+    for (const el of all) {
+      if (this._isBlockedOrReadonly(el) || this._hasValue(el)) continue;
+      const ctx = this._getFieldContext(el);
+      const val2 = this._determinePhase2Value(ctx, patient);
+      if (val2) {
+        if (ctx.tag === 'select') this._selectNativeOption(el, val2);
+        else this._setNativeValue(el, val2);
+        this._highlightField(el, 'filled');
+        results.filled.push({ field: el, value: val2, source: 'phase2' });
+      }
+    }
+
+    // 4. Barrido de radios, checkboxes y dropdowns restantes
+    this._sweepRadioGroups(all, opts, results);
+    this._sweepCheckboxes(all, opts, results);
+    await this._sweepCustomSelects(all, opts, results);
+
+    return results;
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     9. EJECUCIÓN PRINCIPAL: MOTOR EN 2 FASES
+     ══════════════════════════════════════════════════════════════ */
+
+  _scanAllInteractiveFields() {
+    const all = this._collectAllElements(document);
+    return all.filter((el) => {
+      if (!el || !el.tagName) return false;
+      const tag = el.tagName.toLowerCase();
+      if (['select', 'textarea'].includes(tag)) return this._isVisible(el);
+      if (tag === 'input') {
+        const type = (el.type || '').toLowerCase();
+        if (['hidden', 'submit', 'button', 'reset', 'image', 'file'].includes(type)) return false;
+        return this._isVisible(el);
+      }
+      if (this._isCustomDropdownElement(el)) return this._isVisible(el);
+      const role = (el.getAttribute('role') || '').toLowerCase();
+      if (['radiogroup', 'radio', 'checkbox'].includes(role)) return this._isVisible(el);
+      return false;
     });
   }
 
-  /* ═══════════════════════════════════════════
-     FEEDBACK VISUAL
-     ═══════════════════════════════════════════ */
+  async fillForm(patient, options = {}) {
+    const opts = { ...this.settings, ...options };
+    const results = { filled: [], unresolved: [], skipped: [] };
+
+    this._clearHighlights();
+
+    // ─────────────────────────────────────────────────────────────
+    // FASE 1: DATOS DEL EXCEL Y FAMILIA UNIPERSONAL
+    // ─────────────────────────────────────────────────────────────
+    let allFields = this._scanAllInteractiveFields();
+
+    for (const field of allFields) {
+      if (this._isBlockedOrReadonly(field)) continue;
+
+      const tag = field.tagName.toLowerCase();
+      const type = (field.type || '').toLowerCase();
+
+      if (type === 'radio' || type === 'checkbox' || this._isCustomDropdownElement(field)) {
+        continue;
+      }
+
+      if (!opts.overwrite && this._hasValue(field)) {
+        results.skipped.push({ field, reason: 'already-filled' });
+        continue;
+      }
+
+      const ctx = this._getFieldContext(field);
+      const val1 = this._determinePhase1Value(ctx, patient, opts);
+
+      if (val1 !== null && val1 !== undefined && val1 !== '') {
+        if (tag === 'select') {
+          const ok = this._selectNativeOption(field, val1);
+          if (!ok) {
+            const fuzzy = this._findBestOption(ctx, [val1]);
+            if (fuzzy) this._selectNativeOption(field, fuzzy);
+          }
+        } else {
+          this._setNativeValue(field, val1);
+        }
+        field.setAttribute('data-siaps-phase', '1');
+        this._highlightField(field, 'filled');
+        results.filled.push({ field, context: ctx, value: val1, phase: '1' });
+      }
+    }
+
+    // Espera asíncrona para cascadas (ej. Departamento -> Municipio)
+    await this._sleep(350);
+
+    allFields = this._scanAllInteractiveFields();
+    for (const field of allFields) {
+      if (this._isBlockedOrReadonly(field)) continue;
+      if (field.tagName.toLowerCase() === 'select' && !this._hasValue(field)) {
+        const ctx = this._getFieldContext(field);
+        const val1 = this._determinePhase1Value(ctx, patient, opts);
+        if (val1 !== null && val1 !== '') {
+          this._selectNativeOption(field, val1);
+          field.setAttribute('data-siaps-phase', '1');
+          this._highlightField(field, 'filled');
+          results.filled.push({ field, context: ctx, value: val1, phase: '1' });
+          await this._sleep(250);
+        }
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // FASE 2: BARRIDO UNIVERSAL DE CAMPOS ASUMIDOS
+    // ─────────────────────────────────────────────────────────────
+    allFields = this._scanAllInteractiveFields();
+
+    // 1. Inputs nativos
+    for (const field of allFields) {
+      if (this._isBlockedOrReadonly(field)) continue;
+
+      const tag = field.tagName.toLowerCase();
+      const type = (field.type || '').toLowerCase();
+
+      if (type === 'radio' || type === 'checkbox' || this._isCustomDropdownElement(field)) {
+        continue;
+      }
+
+      if (!opts.overwrite && this._hasValue(field)) {
+        continue;
+      }
+
+      const ctx = this._getFieldContext(field);
+      const val2 = this._determinePhase2Value(ctx, patient);
+
+      if (val2 !== null && val2 !== undefined && val2 !== '') {
+        if (tag === 'select') {
+          this._selectNativeOption(field, val2);
+        } else {
+          this._setNativeValue(field, val2);
+        }
+        field.setAttribute('data-siaps-phase', '2');
+        this._highlightField(field, 'filled');
+        results.filled.push({ field, context: ctx, value: val2, phase: '2' });
+      } else if (ctx.required) {
+        results.unresolved.push({ field, context: ctx });
+        this._highlightField(field, 'unresolved');
+      }
+    }
+
+    // 2. Radios
+    this._sweepRadioGroups(allFields, opts, results);
+
+    // 3. Checkboxes
+    this._sweepCheckboxes(allFields, opts, results);
+
+    // 4. Desplegables personalizados ("Seleccione...")
+    await this._sweepCustomSelects(allFields, opts, results);
+
+    return results;
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     10. FEEDBACK VISUAL Y LIMPIEZA
+     ══════════════════════════════════════════════════════════════ */
 
   _highlightField(field, type) {
+    if (!field || !field.style) return;
     const prevTransition = field.style.transition;
     field.style.transition = 'box-shadow 0.3s, border-color 0.3s';
 
@@ -705,7 +1417,6 @@ class AutofillEngine {
       field.setAttribute('data-siaps-unresolved', 'true');
     }
 
-    // Quitar highlight después de 8 segundos
     setTimeout(() => {
       field.style.boxShadow = '';
       field.style.borderColor = '';
@@ -714,84 +1425,25 @@ class AutofillEngine {
   }
 
   _clearHighlights() {
-    document.querySelectorAll('[data-siaps-filled], [data-siaps-unresolved]').forEach((el) => {
-      el.style.boxShadow = '';
-      el.style.borderColor = '';
-      el.removeAttribute('data-siaps-filled');
-      el.removeAttribute('data-siaps-unresolved');
-    });
-  }
-
-  /* ═══════════════════════════════════════════
-     FUNCIÓN PRINCIPAL
-     ═══════════════════════════════════════════ */
-
-  async fillForm(patient, options = {}) {
-    const opts = { ...this.settings, ...options };
-    const results = { filled: [], unresolved: [], skipped: [] };
-
-    this._clearHighlights();
-
-    // 1. Campos estándar (inputs, textareas, selects)
-    const fields = this._scanVisibleFields();
-
-    for (const field of fields) {
-      const ctx = this._getFieldContext(field);
-
-      // Respetar overwrite
-      if (!opts.overwrite && this._hasValue(field)) {
-        results.skipped.push({ field, context: ctx, reason: 'already-filled' });
-        continue;
-      }
-
-      const value = this._determineValue(ctx, patient, opts);
-
-      if (value !== null && value !== undefined && value !== '') {
-        if (ctx.tag === 'select') {
-          const success = this._selectOption(field, value);
-          if (!success) {
-            // Intentar fuzzy
-            const fuzzyVal = this._findBestOption(ctx, [value]);
-            if (fuzzyVal) {
-              this._selectOption(field, fuzzyVal);
-              this._setNativeValue(field, fuzzyVal);
-            }
-          }
-        } else {
-          this._setNativeValue(field, value);
-        }
-        results.filled.push({ field, context: ctx, value });
-        this._highlightField(field, 'filled');
-      } else if (ctx.required) {
-        results.unresolved.push({ field, context: ctx });
-        this._highlightField(field, 'unresolved');
+    const all = this._collectAllElements(document);
+    for (const el of all) {
+      if (el.hasAttribute && (el.hasAttribute('data-siaps-filled') || el.hasAttribute('data-siaps-unresolved'))) {
+        el.style.boxShadow = '';
+        el.style.borderColor = '';
+        el.removeAttribute('data-siaps-filled');
+        el.removeAttribute('data-siaps-unresolved');
+        el.removeAttribute('data-siaps-phase');
       }
     }
-
-    // 2. Radio buttons en grupo
-    const radioResults = this._handleRadioGroups(patient, opts);
-    results.filled.push(...radioResults);
-
-    // 3. Custom controls
-    this._handleCustomControls(patient, opts, results);
-
-    // 4. Selects en cascada (esperar y hacer pasadas adicionales)
-    await this._handleCascadeSelects(patient, opts, results);
-
-    return results;
   }
 
-  /* ═══════════════════════════════════════════
-     EXPORTAR MAPA DE CAMPOS (SIN DATOS PERSONALES)
-     ═══════════════════════════════════════════ */
-
   exportFieldMap() {
-    const allFields = [
-      ...document.querySelectorAll('input, textarea, select'),
-    ].filter((el) => this._isVisible(el));
+    const all = this._scanAllInteractiveFields();
 
-    return allFields.map((el) => {
+    return all.map((el) => {
       const ctx = this._getFieldContext(el);
+      const isCustomDrop = this._isCustomDropdownElement(el);
+
       const meta = {
         tag: ctx.tag,
         type: ctx.type || undefined,
@@ -799,37 +1451,23 @@ class AutofillEngine {
         name: ctx.name || undefined,
         label: ctx.label || undefined,
         placeholder: ctx.placeholder || undefined,
-        ariaLabel: ctx.ariaLabel || undefined,
+        isCustomDropdown: isCustomDrop || undefined,
         required: ctx.required || undefined,
         minlength: ctx.minlength > 0 ? ctx.minlength : undefined,
         maxlength: ctx.maxlength < Infinity ? ctx.maxlength : undefined,
-        min: ctx.min || undefined,
-        max: ctx.max || undefined,
-        step: ctx.step || undefined,
-        pattern: ctx.pattern || undefined,
-        role: ctx.role || undefined,
       };
 
-      // Opciones de select (sin valores personales)
       if (ctx.tag === 'select') {
-        meta.options = ctx.options.map((o) => ({ value: o.value, text: o.text }));
+        meta.options = (ctx.options || []).map((o) => ({ value: o.value, text: o.text }));
       }
 
-      // Radios del mismo grupo
-      if (ctx.type === 'radio' && ctx.name) {
-        const radios = document.querySelectorAll(`input[type="radio"][name="${CSS.escape(ctx.name)}"]`);
-        meta.radioOptions = Array.from(radios).map((r) => ({
-          value: r.value,
-          label: this._getRadioLabel(r),
-        }));
-      }
-
-      // Limpiar undefined
-      Object.keys(meta).forEach((k) => { if (meta[k] === undefined) delete meta[k]; });
+      Object.keys(meta).forEach((k) => {
+        if (meta[k] === undefined) delete meta[k];
+      });
 
       return meta;
     });
   }
 }
 
-console.log('[SI-APS] AutofillEngine cargado.');
+console.log('[SI-APS] AutofillEngine (v3 con Plantillas y Desplegables Custom) cargado.');
